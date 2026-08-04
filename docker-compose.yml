@@ -1,0 +1,64 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: mmo
+      POSTGRES_USER: mmo
+      POSTGRES_PASSWORD: mmo
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  game-server:
+    build:
+      context: .
+      dockerfile: infra/docker/node-app.Dockerfile
+      args:
+        APP: "@mmo/game-server"
+    environment:
+      GAME_HTTP_PORT: 3100
+      GAME_WS_PORT: 3101
+      GAME_SNAPSHOT_MS: 50
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "3100:3100"
+      - "3101:3101"
+    depends_on:
+      - redis
+
+  auth-server:
+    build:
+      context: .
+      dockerfile: infra/docker/node-app.Dockerfile
+      args:
+        APP: "@mmo/auth-server"
+    environment:
+      AUTH_HTTP_PORT: 3200
+      POSTGRES_HOST: postgres
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "3200:3200"
+    depends_on:
+      - postgres
+      - redis
+
+  blockchain-service:
+    build:
+      context: .
+      dockerfile: infra/docker/node-app.Dockerfile
+      args:
+        APP: "@mmo/blockchain-service"
+    environment:
+      BLOCKCHAIN_HTTP_PORT: 3300
+      TON_NETWORK: testnet
+    ports:
+      - "3300:3300"
+
+volumes:
+  postgres-data:

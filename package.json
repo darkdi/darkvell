@@ -1,0 +1,31 @@
+{
+  "name": "mmo-crypto-pvp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Browser MMORPG vertical slice with realtime PvP, monster farming, inventory and wallet claiming.",
+  "packageManager": "npm@10.8.0",
+  "workspaces": [
+    "client",
+    "game-server",
+    "auth-server",
+    "blockchain-service",
+    "admin-panel",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w @mmo/shared && npm run build -w @mmo/game-server && npm run build -w @mmo/auth-server && npm run build -w @mmo/blockchain-service && npm run build -w @mmo/client && npm run build -w @mmo/admin-panel",
+    "build:shared": "npm run build -w @mmo/shared",
+    "dev": "npm run build:shared && concurrently \"npm run dev -w @mmo/game-server\" \"npm run dev -w @mmo/auth-server\" \"npm run dev -w @mmo/blockchain-service\" \"npm run dev -w @mmo/client\" \"npm run dev -w @mmo/admin-panel\"",
+    "dev:client": "npm run build:shared && npm run dev -w @mmo/client",
+    "dev:server": "npm run build:shared && npm run dev -w @mmo/game-server",
+    "lint": "npm run lint --workspaces --if-present"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "typescript": "^5.6.3"
+  },
+  "engines": {
+    "node": ">=20.11.0",
+    "npm": ">=10.0.0"
+  }
+}

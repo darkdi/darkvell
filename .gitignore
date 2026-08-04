@@ -1,0 +1,77 @@
+# Dependencies and build output
+**/node_modules/
+**/dist/
+**/build/
+**/coverage/
+.turbo/
+.vite/
+.gradle/
+packages/shared/src/*.js
+packages/shared/src/*.js.map
+packages/shared/src/*.d.ts
+
+# Local toolchains, runtime state and editor files
+.tools/
+.local-run/
+.idea/
+.claude/
+.Codex/
+.codex/
+.DS_Store
+*.log
+*.pid
+
+# Secrets and machine-specific configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+keystore.properties
+local.properties
+
+# Player/account data, uploads and moderation state
+**/data/
+**/uploads/
+*.bak
+*.bak-*
+
+# Local and production backups
+.codex-backups/
+backups/
+tmp/
+
+# Android release artifacts and signing material
+android-rustore/keystores/
+android-rustore/release/
+android-rustore/app/build/
+*.apk
+*.aab
+
+# Copyrighted music and private portraits (kept locally, never published)
+*.mp3
+*.wav
+*.m4a
+*.flac
+client/public/songs/
+client/public/guf-head*.png
+client/public/kirs-head*.png
+client/public/unit-head*.png
+
+# Third-party editable and generated art is not part of the open-source grant
+monsters/
+world/
+client/public/assets/monsters/
+client/public/assets/world/
+
+# Internal operational notes and production runbooks
+AGENTS.md
+CLAUDE.md
+CODEX_HANDOFF*.md
+docs/CODEX_CONTEXT.md
+docs/README_LOCAL_PROD.md
+docs/deploy-*.md

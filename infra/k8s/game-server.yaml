@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: game-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: game-server
+  template:
+    metadata:
+      labels:
+        app: game-server
+    spec:
+      containers:
+        - name: game-server
+          image: mmo/game-server:0.1.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: GAME_HTTP_PORT
+              value: "3100"
+            - name: GAME_WS_PORT
+              value: "3101"
+            - name: GAME_SNAPSHOT_MS
+              value: "50"
+            - name: REDIS_URL
+              value: redis://redis:6379
+          ports:
+            - containerPort: 3100
+              name: http
+            - containerPort: 3101
+              name: ws
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: game-server
+spec:
+  selector:
+    app: game-server
+  ports:
+    - name: http
+      port: 3100
+      targetPort: 3100
+    - name: ws
+      port: 3101
+      targetPort: 3101

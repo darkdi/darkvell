@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blockchain-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: blockchain-service
+  template:
+    metadata:
+      labels:
+        app: blockchain-service
+    spec:
+      containers:
+        - name: blockchain-service
+          image: mmo/blockchain-service:0.1.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: BLOCKCHAIN_HTTP_PORT
+              value: "3300"
+            - name: TON_NETWORK
+              value: testnet
+          ports:
+            - containerPort: 3300
+              name: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: blockchain-service
+spec:
+  selector:
+    app: blockchain-service
+  ports:
+    - name: http
+      port: 3300
+      targetPort: 3300

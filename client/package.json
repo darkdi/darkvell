@@ -1,0 +1,29 @@
+{
+  "name": "@mmo/client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0 --port ${CLIENT_PORT:-5173}",
+    "build": "tsc -p tsconfig.json && vite build",
+    "preview": "vite preview --host 0.0.0.0 --port 4173",
+    "lint": "tsc -p tsconfig.json --noEmit && npm run lint:i18n",
+    "lint:i18n": "node scripts/check-i18n-coverage.mjs"
+  },
+  "dependencies": {
+    "@mmo/shared": "0.1.0",
+    "@tonconnect/ui-react": "^2.0.9",
+    "lucide-react": "^0.468.0",
+    "phaser": "^3.87.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.8.4",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.3",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10"
+  }
+}

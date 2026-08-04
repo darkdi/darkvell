@@ -1,0 +1,51 @@
+import java.util.Properties
+
+plugins {
+    id "com.android.application"
+}
+
+def keystoreProperties = new Properties()
+def keystorePropertiesFile = rootProject.file("keystore.properties")
+if (keystorePropertiesFile.exists()) {
+    keystorePropertiesFile.withInputStream { stream ->
+        keystoreProperties.load(stream)
+    }
+}
+
+android {
+    namespace "ru.darkvell.game"
+    compileSdk 35
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    defaultConfig {
+        applicationId "ru.darkvell.game"
+        minSdk 24
+        targetSdk 35
+        versionCode 2064640520
+        versionName "0.1.2"
+    }
+
+    signingConfigs {
+        release {
+            storeFile file(keystoreProperties["storeFile"] ?: "../keystores/darkvell-rustore-release.jks")
+            storePassword keystoreProperties["storePassword"] ?: ""
+            keyAlias keystoreProperties["keyAlias"] ?: "darkvell-rustore"
+            keyPassword keystoreProperties["keyPassword"] ?: ""
+        }
+    }
+
+    buildTypes {
+        debug {
+            applicationIdSuffix ".debug"
+            versionNameSuffix "-debug"
+        }
+        release {
+            minifyEnabled false
+            shrinkResources false
+            signingConfig signingConfigs.release
+        }
+    }
+}

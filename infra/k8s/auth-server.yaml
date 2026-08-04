@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: auth-server
+  template:
+    metadata:
+      labels:
+        app: auth-server
+    spec:
+      containers:
+        - name: auth-server
+          image: mmo/auth-server:0.1.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: AUTH_HTTP_PORT
+              value: "3200"
+          ports:
+            - containerPort: 3200
+              name: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth-server
+spec:
+  selector:
+    app: auth-server
+  ports:
+    - name: http
+      port: 3200
+      targetPort: 3200
