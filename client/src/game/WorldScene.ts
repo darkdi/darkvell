@@ -352,10 +352,53 @@ const CUSTOM_PLAYER_HEADS: Record<
     labelOffsetY: number;
     hpBarOffsetY: number;
   }
-> = {};
+> = {
+  unit: {
+    texture: "unit-custom-head",
+    url: "/unit-head.png",
+    scale: 0.08,
+    offsetY: -22,
+    labelOffsetY: -64,
+    hpBarOffsetY: -50
+  },
+  kirs: {
+    texture: "kirs-custom-head",
+    url: "/kirs-head.png",
+    scale: 0.08,
+    offsetY: -22,
+    labelOffsetY: -64,
+    hpBarOffsetY: -50
+  },
+  guf: {
+    texture: "guf-custom-head",
+    url: "/guf-head.png",
+    scale: 0.082,
+    offsetY: -22,
+    labelOffsetY: -64,
+    hpBarOffsetY: -50
+  }
+};
 type CustomPlayerHeadConfig = (typeof CUSTOM_PLAYER_HEADS)[string];
-// Intentionally empty in the public source tree. Add only music you are licensed to redistribute.
-const SINGING_TRACK_URLS: Record<number, string> = {};
+// Audio files stay private and are excluded by .gitignore; only their runtime routes live in source.
+const SINGING_TRACK_URLS: Record<number, string> = {
+  1: "/songs/kirs/1.mp3",
+  2: "/songs/kirs/2.mp3",
+  3: "/songs/kirs/3.mp3",
+  4: "/songs/kirs/4.mp3",
+  5: "/songs/kirs/5.mp3",
+  6: "/songs/kirs/6.mp3",
+  7: "/songs/kirs/7.mp3",
+  101: "/songs/guf/1.mp3",
+  102: "/songs/guf/2.mp3",
+  103: "/songs/guf/3.mp3",
+  104: "/songs/guf/4.mp3",
+  105: "/songs/guf/5.mp3",
+  106: "/songs/guf/6.mp3",
+  107: "/songs/guf/7.mp3",
+  108: "/songs/guf/8.mp3",
+  109: "/songs/guf/9.mp3",
+  110: "/songs/guf/10.mp3"
+};
 const SINGING_AUDIO_FULL_RADIUS = 38;
 const SINGING_AUDIO_MAX_RADIUS = 1180;
 const SINGING_AUDIO_MAX_VOLUME = 0.42;

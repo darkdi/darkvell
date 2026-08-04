@@ -2397,7 +2397,7 @@ export function App() {
       setLocalFacingOverrideDegrees(undefined);
     }
   }, [mapUsesReactFacing]);
-  const canUseSinging = localPlayer ? ["lyra", "rook"].includes(localPlayer.name.trim().toLowerCase()) : false;
+  const canUseSinging = localPlayer ? ["kirs", "guf"].includes(localPlayer.name.trim().toLowerCase()) : false;
   const rawLocationBanner = useMemo(
     () => locationBannerForPosition(localPlayer?.position),
     [localPlayer?.position.x, localPlayer?.position.y]
@@ -7022,13 +7022,13 @@ export function App() {
                       <div className="settingsBoxHeader">
                         <div>
                           <strong>{tr("Profile face")}</strong>
-                          <span>{tr("Square PNG portrait with a transparent background and no text or logos.")}</span>
+                          <span>{tr("PNG face like Kirs/Unit: square, transparent background, no text or logos.")}</span>
                         </div>
                         <span className="customHeadBadge">{tr(accountSession?.authProvider === "account" ? "Account" : "Account only")}</span>
                       </div>
                       <div className="customHeadBody">
                         <span className="customHeadPreview">
-                          <img src={customHeadUrl ?? "/web-app-manifest-192x192.png"} alt="" />
+                          <img src={customHeadUrl ?? "/kirs-head.png"} alt="" />
                         </span>
                         <div className="customHeadActions">
                           <input

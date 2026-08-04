@@ -863,10 +863,10 @@ const BOT_ARENA_BOT_TARGET_MELEE_CAP = 1;
 const BOT_ARENA_BOT_TARGET_RANGED_CAP = 2;
 const BOT_ARENA_HUMAN_TARGET_MELEE_CAP = 3;
 const BOT_ARENA_HUMAN_TARGET_RANGED_CAP = 5;
-const BOT_LEAD_SINGER_CROWD_INNER_RADIUS = 760;
-const BOT_LEAD_SINGER_CROWD_RADIUS = 1320;
-const BOT_LEAD_SINGER_CROWD_INNER_KEEP = 2;
-const BOT_LEAD_SINGER_CROWD_KEEP = 5;
+const BOT_GUF_CROWD_INNER_RADIUS = 760;
+const BOT_GUF_CROWD_RADIUS = 1320;
+const BOT_GUF_CROWD_INNER_KEEP = 2;
+const BOT_GUF_CROWD_KEEP = 5;
 const BOT_POPULATION_RECHECK_MS = 35_000;
 const BOT_NORMAL_MOVE_PACE = 0.62;
 const BOT_SPRINT_MOVE_PACE = 0.74;
@@ -1845,9 +1845,9 @@ const SINGER_ROUTE_HOLD_DRIFT_MAX_MS = 6_800;
 const SINGER_DEFAULT_TRACK_DURATION_MS = 110_000;
 const SINGER_DEFINITIONS: readonly SingerDefinition[] = [
   {
-    name: "Lyra",
-    npcId: "npc_singer_lyra",
-    characterId: "npc_singer_lyra",
+    name: "Kirs",
+    npcId: "npc_singer_kirs",
+    characterId: "npc_singer_kirs",
     classId: "assassin",
     race: "human",
     trackIds: [1, 2, 3, 4, 5, 6, 7],
@@ -1862,9 +1862,9 @@ const SINGER_DEFINITIONS: readonly SingerDefinition[] = [
     }
   },
   {
-    name: "Rook",
-    npcId: "npc_singer_rook",
-    characterId: "npc_singer_rook",
+    name: "Guf",
+    npcId: "npc_singer_guf",
+    characterId: "npc_singer_guf",
     classId: "assassin",
     race: "human",
     trackIds: [101, 102, 103, 104, 105, 106, 107, 108, 109, 110],
@@ -8070,7 +8070,7 @@ export class WorldService {
     if (clanMate && this.updateBotClanFollow(bot, brain, clanMate, now)) {
       return;
     }
-    if (this.updateBotLeadSingerCrowdDispersal(bot, brain, now)) {
+    if (this.updateBotGufCrowdDispersal(bot, brain, now)) {
       return;
     }
     if (this.updateBotArenaHubDispersal(bot, brain, now)) {
@@ -8456,16 +8456,16 @@ export class WorldService {
     return count;
   }
 
-  private activeLeadSingerNear(position: Vector2): PlayerPrivateState | undefined {
+  private activeGufSingerNear(position: Vector2): PlayerPrivateState | undefined {
     let selected: PlayerPrivateState | undefined;
     let selectedDistance = Number.POSITIVE_INFINITY;
     for (const player of this.players.values()) {
-      if (player.hp <= 0 || player.downed || !player.singing || this.singerDefinitionForName(player.name)?.name !== "Rook") {
+      if (player.hp <= 0 || player.downed || !player.singing || this.singerDefinitionForName(player.name)?.name !== "Guf") {
         continue;
       }
 
       const distance = this.distance(player.position, position);
-      if (distance <= BOT_LEAD_SINGER_CROWD_RADIUS && distance < selectedDistance) {
+      if (distance <= BOT_GUF_CROWD_RADIUS && distance < selectedDistance) {
         selected = player;
         selectedDistance = distance;
       }
@@ -8490,14 +8490,14 @@ export class WorldService {
       .findIndex((entry) => entry.player.id === bot.id);
   }
 
-  private leadSingerCrowdDispersalPoint(bot: PlayerPrivateState, brain: BotBrain, singer: PlayerPrivateState): Vector2 {
+  private gufCrowdDispersalPoint(bot: PlayerPrivateState, brain: BotBrain, singer: PlayerPrivateState): Vector2 {
     const eligible = BOT_HUNTING_GROUNDS
       .map((ground, groundIndex) => ({ ground, groundIndex }))
       .filter(
         ({ ground }) =>
           ground.level <= bot.level + 7 &&
           ground.level >= Math.max(1, bot.level - 12) &&
-          this.distance(ground.position, singer.position) > BOT_LEAD_SINGER_CROWD_RADIUS + 900
+          this.distance(ground.position, singer.position) > BOT_GUF_CROWD_RADIUS + 900
       );
     const pool =
       eligible.length > 0
@@ -8511,7 +8511,7 @@ export class WorldService {
         score:
           Math.abs(entry.ground.level - Math.max(1, bot.level - 1)) * 150 +
           this.playerCrowdCount(entry.ground.position, entry.ground.radius + 780, "bot") * 430 +
-          Math.max(0, BOT_LEAD_SINGER_CROWD_RADIUS + 1200 - this.distance(entry.ground.position, singer.position)) * 0.55 +
+          Math.max(0, BOT_GUF_CROWD_RADIUS + 1200 - this.distance(entry.ground.position, singer.position)) * 0.55 +
           Math.sin((brain.index + 1) * 15.41 + entry.groundIndex * 4.77 + this.tick * 0.006) * 110
       }))
       .sort((first, second) => first.score - second.score)
@@ -8524,38 +8524,38 @@ export class WorldService {
     const away = this.normalize({ x: bot.position.x - singer.position.x, y: bot.position.y - singer.position.y });
     const direction = away.x === 0 && away.y === 0 ? { x: Math.cos(brain.roamSeed), y: Math.sin(brain.roamSeed) } : away;
     return this.pushOutOfWorldObstacles(this.clampPosition({
-      x: singer.position.x + direction.x * (BOT_LEAD_SINGER_CROWD_RADIUS + 900),
-      y: singer.position.y + direction.y * (BOT_LEAD_SINGER_CROWD_RADIUS + 900)
+      x: singer.position.x + direction.x * (BOT_GUF_CROWD_RADIUS + 900),
+      y: singer.position.y + direction.y * (BOT_GUF_CROWD_RADIUS + 900)
     }));
   }
 
-  private updateBotLeadSingerCrowdDispersal(bot: PlayerPrivateState, brain: BotBrain, now: number): boolean {
+  private updateBotGufCrowdDispersal(bot: PlayerPrivateState, brain: BotBrain, now: number): boolean {
     if ((brain.arenaUntil ?? 0) > now || bot.hp / bot.maxHp < 0.72 || brain.targetId) {
       return false;
     }
 
-    const singer = this.activeLeadSingerNear(bot.position);
+    const singer = this.activeGufSingerNear(bot.position);
     if (!singer) {
       return false;
     }
 
-    const innerBotCount = this.playerCrowdCount(singer.position, BOT_LEAD_SINGER_CROWD_INNER_RADIUS, "bot");
-    const outerBotCount = this.playerCrowdCount(singer.position, BOT_LEAD_SINGER_CROWD_RADIUS, "bot");
-    const innerRank = this.distance(bot.position, singer.position) <= BOT_LEAD_SINGER_CROWD_INNER_RADIUS ? this.botCrowdRankAround(bot, singer.position, BOT_LEAD_SINGER_CROWD_INNER_RADIUS) : -1;
-    const outerRank = this.botCrowdRankAround(bot, singer.position, BOT_LEAD_SINGER_CROWD_RADIUS);
-    const tooClose = innerRank >= BOT_LEAD_SINGER_CROWD_INNER_KEEP && innerBotCount > BOT_LEAD_SINGER_CROWD_INNER_KEEP;
-    const tooCrowded = outerRank >= BOT_LEAD_SINGER_CROWD_KEEP && outerBotCount > BOT_LEAD_SINGER_CROWD_KEEP;
+    const innerBotCount = this.playerCrowdCount(singer.position, BOT_GUF_CROWD_INNER_RADIUS, "bot");
+    const outerBotCount = this.playerCrowdCount(singer.position, BOT_GUF_CROWD_RADIUS, "bot");
+    const innerRank = this.distance(bot.position, singer.position) <= BOT_GUF_CROWD_INNER_RADIUS ? this.botCrowdRankAround(bot, singer.position, BOT_GUF_CROWD_INNER_RADIUS) : -1;
+    const outerRank = this.botCrowdRankAround(bot, singer.position, BOT_GUF_CROWD_RADIUS);
+    const tooClose = innerRank >= BOT_GUF_CROWD_INNER_KEEP && innerBotCount > BOT_GUF_CROWD_INNER_KEEP;
+    const tooCrowded = outerRank >= BOT_GUF_CROWD_KEEP && outerBotCount > BOT_GUF_CROWD_KEEP;
     if (!tooClose && !tooCrowded) {
       return false;
     }
 
     const existingTarget =
       brain.roamTarget &&
-      this.distance(brain.roamTarget, singer.position) > BOT_LEAD_SINGER_CROWD_RADIUS + 900 &&
+      this.distance(brain.roamTarget, singer.position) > BOT_GUF_CROWD_RADIUS + 900 &&
       this.distance(bot.position, brain.roamTarget) > 180
         ? brain.roamTarget
         : undefined;
-    const target = existingTarget ?? this.leadSingerCrowdDispersalPoint(bot, brain, singer);
+    const target = existingTarget ?? this.gufCrowdDispersalPoint(bot, brain, singer);
     const distance = this.distance(bot.position, target);
     brain.targetId = undefined;
     brain.forcePkTargetId = undefined;

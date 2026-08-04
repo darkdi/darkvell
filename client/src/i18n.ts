@@ -144,8 +144,8 @@ const RU_EXACT: Record<string, string> = {
   "Voice channel": "Голосовой канал",
   "Nearby": "Рядом",
   "Profile face": "Лицо профиля",
-  "Square PNG portrait with a transparent background and no text or logos.":
-    "Квадратный PNG-портрет с прозрачным фоном, без текста и логотипов.",
+  "PNG face like Kirs/Unit: square, transparent background, no text or logos.":
+    "PNG-портрет как у Kirs/Unit: квадратный, прозрачный фон, без текста и логотипов.",
   "Server rejects plain screenshots, text banners and non-transparent images.":
     "Сервер отклоняет обычные скриншоты, текстовые баннеры и изображения без прозрачности.",
   "Graphics": "Графика",
