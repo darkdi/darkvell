@@ -2397,7 +2397,7 @@ export function App() {
       setLocalFacingOverrideDegrees(undefined);
     }
   }, [mapUsesReactFacing]);
-  const canUseSinging = localPlayer ? ["kirs", "guf"].includes(localPlayer.name.trim().toLowerCase()) : false;
+  const canUseSinging = localPlayer ? localPlayer.name.trim().toLowerCase() === "kirs" : false;
   const rawLocationBanner = useMemo(
     () => locationBannerForPosition(localPlayer?.position),
     [localPlayer?.position.x, localPlayer?.position.y]

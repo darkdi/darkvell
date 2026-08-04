@@ -58,9 +58,7 @@ android-rustore/app/build/
 *.m4a
 *.flac
 client/public/songs/
-client/public/guf-head*.png
-client/public/kirs-head*.png
-client/public/unit-head*.png
+client/public/*-head*.png
 
 # Third-party editable and generated art is not part of the open-source grant
 monsters/
