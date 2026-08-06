@@ -801,6 +801,7 @@ export class WorldScene extends Phaser.Scene {
     this.resetTouchOwnership();
   };
   private lastPhaserWorldPointerDown?: { x: number; y: number; at: number };
+  private lastAttackOutcome = "-";
   private static readonly JUMP_DURATION_MS = 430;
   private static readonly ARCHER_HOLD_DRAW_DELAY_MS = 180;
   private static readonly CAMERA_EDGE_PADDING = 2200;
@@ -1020,10 +1021,12 @@ export class WorldScene extends Phaser.Scene {
   attackNearestTarget(): void {
     const local = this.localPlayer();
     if (!local) {
+      this.lastAttackOutcome = "noPlayer";
       return;
     }
 
     if (!this.localCanAct(local)) {
+      this.lastAttackOutcome = "cannotAct";
       return;
     }
 
@@ -1033,6 +1036,7 @@ export class WorldScene extends Phaser.Scene {
     if (target && this.isPlayerTarget(target) && !this.canAttackPlayerWithoutPk(target, local) && !this.isForcePkDown()) {
       this.selectedTargetId = target.id;
       this.announceSelectedTarget();
+      this.lastAttackOutcome = "pkBlocked";
       return;
     }
     if (target && !this.canAttackTarget(target)) {
@@ -1040,9 +1044,11 @@ export class WorldScene extends Phaser.Scene {
       this.pendingSkillTargetId = undefined;
       this.pendingAttackTargetId = target.id;
       this.setMoveTarget(this.approachPointForTarget(target), !this.isMobileTouchMode());
+      this.lastAttackOutcome = "approach";
       return;
     }
 
+    this.lastAttackOutcome = target ? "sent" : "sentNoTarget";
     if (local.classId === "archer") {
       this.attack(aim.x, aim.y, target?.id, 0);
       return;
@@ -8560,24 +8566,28 @@ export class WorldScene extends Phaser.Scene {
     if (this.isAttackButtonPoint(point)) {
       this.resumeAudio();
       this.attackNearestTarget();
+      touchDiag.event(`btn attack -> ${this.lastAttackOutcome}`);
       return true;
     }
 
     if (this.isSkillButtonPoint(point)) {
       this.resumeAudio();
       this.triggerRoll(true);
+      touchDiag.event("btn dash");
       return true;
     }
 
     if (this.isJumpButtonPoint(point)) {
       this.resumeAudio();
       this.mobileSprint();
+      touchDiag.event("btn sprint");
       return true;
     }
 
     if (this.isPkButtonPoint(point)) {
       this.resumeAudio();
       this.togglePkModeLock();
+      touchDiag.event("btn pk");
       return true;
     }
 

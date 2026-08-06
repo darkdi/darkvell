@@ -47,6 +47,23 @@ interface LogEntry {
   text: string;
 }
 
+// A "freeze" is a window where the player was clearly tapping fast and then the
+// page stopped receiving touches. Capturing it automatically removes the need
+// to screenshot at the exact instant the bug hits.
+interface FreezeRecord {
+  at: number;
+  gapMs: number;
+  frames: number;
+  fpsDuring: number;
+  gestures: number;
+  cancels: number;
+  scale: string;
+}
+
+const FREEZE_MIN_GAP_MS = 600;
+const FREEZE_BURST_WINDOW_MS = 2_500;
+const FREEZE_MIN_BURST_TAPS = 3;
+
 class TouchDiagnostics {
   readonly enabled = ENABLED;
 
@@ -64,6 +81,16 @@ class TouchDiagnostics {
   private activeTouches = 0;
   private overlay?: HTMLDivElement;
   private renderTimer?: number;
+  private totalFrames = 0;
+  private lastDocTouchAt = 0;
+  private framesAtLastDocTouch = 0;
+  private gesturesAtLastDocTouch = 0;
+  private cancelsAtLastDocTouch = 0;
+  private gestureCount = 0;
+  private readonly recentDocStarts: number[] = [];
+  private worstFreeze?: FreezeRecord;
+  private lastFreeze?: FreezeRecord;
+  private freezeCount = 0;
 
   start(): void {
     if (!this.enabled || this.overlay) {
@@ -80,6 +107,17 @@ class TouchDiagnostics {
     window.addEventListener("blur", this.onBlur);
     window.addEventListener("focus", this.onFocus);
     document.addEventListener("visibilitychange", this.onVisibility);
+
+    // iOS Safari fires these when it decides a multi-finger gesture is in
+    // progress. While that happens the page stops receiving touch events even
+    // though rendering continues -- exactly the reported symptom -- so this is
+    // the signal that separates "browser took over" from everything else.
+    // `gesture*` is Safari-only and absent from lib.dom, hence the cast.
+    const target = window as unknown as EventTarget;
+    target.addEventListener("gesturestart", this.onGesture, { passive: true });
+    target.addEventListener("gesturechange", this.onGesture, { passive: true });
+    target.addEventListener("gestureend", this.onGesture, { passive: true });
+    window.visualViewport?.addEventListener("resize", this.onViewport);
 
     this.overlay = document.createElement("div");
     this.overlay.style.cssText = [
@@ -129,6 +167,7 @@ class TouchDiagnostics {
       return;
     }
 
+    this.totalFrames += 1;
     const now = performance.now();
     if (this.lastFrameAt > 0) {
       const delta = now - this.lastFrameAt;
@@ -197,6 +236,9 @@ class TouchDiagnostics {
   private readonly onDocTouchStart = (event: TouchEvent) => {
     this.counts.docStart += 1;
     this.activeTouches = event.touches.length;
+    this.detectFreeze();
+    this.noteDocTouch();
+    this.recentDocStarts.push(performance.now());
     const target = event.target instanceof HTMLElement ? event.target.tagName.toLowerCase() : "?";
     this.event(`doc start n=${event.touches.length} ${target}`);
   };
@@ -204,13 +246,82 @@ class TouchDiagnostics {
   private readonly onDocTouchEnd = (event: TouchEvent) => {
     this.counts.docEnd += 1;
     this.activeTouches = event.touches.length;
+    this.noteDocTouch();
   };
 
   private readonly onDocTouchCancel = (event: TouchEvent) => {
     this.counts.docCancel += 1;
     this.activeTouches = event.touches.length;
+    this.noteDocTouch();
     this.event(`doc CANCEL n=${event.touches.length}`);
   };
+
+  private readonly onGesture = (event: Event) => {
+    this.gestureCount += 1;
+    const scale = (event as Event & { scale?: number }).scale;
+    this.event(`iOS GESTURE ${event.type}${scale === undefined ? "" : ` s=${scale.toFixed(2)}`}`);
+  };
+
+  private readonly onViewport = () => {
+    const viewport = window.visualViewport;
+    this.event(`viewport ${viewport?.width.toFixed(0)}x${viewport?.height.toFixed(0)} s=${viewport?.scale.toFixed(2)}`);
+  };
+
+  private noteDocTouch(): void {
+    this.lastDocTouchAt = performance.now();
+    this.framesAtLastDocTouch = this.totalFrames;
+    this.gesturesAtLastDocTouch = this.gestureCount;
+    this.cancelsAtLastDocTouch = this.counts.docCancel;
+  }
+
+  // Called on a fresh touchstart: measures the silence that just ended. Frames
+  // rendered during that silence are the decisive number -- a live frame count
+  // means the main thread was fine and the browser simply stopped delivering
+  // touches, while a near-zero count means the page was stalled.
+  private detectFreeze(): void {
+    const now = performance.now();
+    if (this.lastDocTouchAt === 0) {
+      return;
+    }
+
+    const gapMs = now - this.lastDocTouchAt;
+    if (gapMs < FREEZE_MIN_GAP_MS) {
+      return;
+    }
+
+    while (this.recentDocStarts.length > 0 && this.lastDocTouchAt - this.recentDocStarts[0] > FREEZE_BURST_WINDOW_MS) {
+      this.recentDocStarts.shift();
+    }
+    if (this.recentDocStarts.length < FREEZE_MIN_BURST_TAPS) {
+      // Not a burst of taps before the silence: the player simply stopped
+      // touching the screen, which is not the bug.
+      return;
+    }
+
+    const frames = this.totalFrames - this.framesAtLastDocTouch;
+    const record: FreezeRecord = {
+      at: now,
+      gapMs,
+      frames,
+      fpsDuring: Math.round((frames * 1000) / gapMs),
+      gestures: this.gestureCount - this.gesturesAtLastDocTouch,
+      cancels: this.counts.docCancel - this.cancelsAtLastDocTouch,
+      scale: window.visualViewport ? window.visualViewport.scale.toFixed(2) : "-"
+    };
+    this.freezeCount += 1;
+    this.lastFreeze = record;
+    if (!this.worstFreeze || record.gapMs > this.worstFreeze.gapMs) {
+      this.worstFreeze = record;
+    }
+    this.event(`FREEZE ${Math.round(gapMs)}ms frames=${frames} (${record.fpsDuring}fps) g=${record.gestures} c=${record.cancels}`);
+  }
+
+  private describeFreeze(label: string, record: FreezeRecord | undefined, now: number): string {
+    if (!record) {
+      return `${label}: none`;
+    }
+    return `${label}: ${Math.round(record.gapMs)}ms frames=${record.frames} ${record.fpsDuring}fps gest=${record.gestures} cnc=${record.cancels} sc=${record.scale} ${((now - record.at) / 1000).toFixed(0)}s ago`;
+  }
 
   private readonly onBlur = () => this.event("window blur");
   private readonly onFocus = () => this.event("window focus");
@@ -232,6 +343,9 @@ class TouchDiagnostics {
     lines.push(
       `cv s/m/e/c ${this.counts.canvasStart}/${this.counts.canvasMove}/${this.counts.canvasEnd}/${this.counts.canvasCancel}  ph ${this.counts.phaserDown}  hud ${this.counts.hud}`
     );
+    lines.push(`freezes ${this.freezeCount}  iOSgesture ${this.gestureCount}`);
+    lines.push(this.describeFreeze("WORST", this.worstFreeze, now));
+    lines.push(this.describeFreeze("LAST ", this.lastFreeze, now));
 
     this.providers.forEach((provider, name) => {
       let state: Record<string, string | number | boolean | undefined>;
@@ -266,6 +380,11 @@ class TouchDiagnostics {
     window.removeEventListener("blur", this.onBlur);
     window.removeEventListener("focus", this.onFocus);
     document.removeEventListener("visibilitychange", this.onVisibility);
+    const target = window as unknown as EventTarget;
+    target.removeEventListener("gesturestart", this.onGesture);
+    target.removeEventListener("gesturechange", this.onGesture);
+    target.removeEventListener("gestureend", this.onGesture);
+    window.visualViewport?.removeEventListener("resize", this.onViewport);
     if (this.renderTimer !== undefined) {
       window.clearInterval(this.renderTimer);
       this.renderTimer = undefined;
