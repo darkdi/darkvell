@@ -102,6 +102,7 @@ import {
   type WalletState
 } from "@mmo/shared";
 import { GameCanvas } from "./game/GameCanvas";
+import { touchDiag } from "./game/touchDiagnostics";
 import {
   loadMobileGraphicsSettings,
   mobileGraphicsPresets,
@@ -3559,8 +3560,10 @@ export function App() {
 
     const key = cooldownKey(entry);
     if ((cooldowns[key]?.readyAt ?? 0) > nowMs) {
+      touchDiag.hudTap(`${entry.type} COOLDOWN`);
       return;
     }
+    touchDiag.hudTap(`${entry.type} fire`);
 
     if (entry.type === "attack") {
       window.dispatchEvent(new CustomEvent("mmo:attackNearest"));
@@ -3672,6 +3675,7 @@ export function App() {
   function activateHotbarPointer(event: ReactPointerEvent<HTMLButtonElement>, entry: HotbarEntry | undefined): void {
     event.preventDefault();
     event.stopPropagation();
+    touchDiag.event(`hud pointerdown ${event.pointerType}#${event.pointerId}`);
     if (entry?.type === "attack" && activeClassDef.id === "archer") {
       event.currentTarget.setPointerCapture?.(event.pointerId);
       window.dispatchEvent(new CustomEvent("mmo:attackHoldStart"));

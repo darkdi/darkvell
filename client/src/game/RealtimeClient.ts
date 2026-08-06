@@ -22,6 +22,7 @@ import type {
   VoiceSignal,
   WalletState
 } from "@mmo/shared";
+import { touchDiag } from "./touchDiagnostics";
 
 type Listener<T> = (payload: T) => void;
 export type RealtimeError = Extract<ServerMessage, { type: "error" }>["payload"];
@@ -88,8 +89,20 @@ export class RealtimeClient {
   private static readonly CRITICAL_BACKPRESSURE_BYTES = 64 * 1024;
   private static readonly HIGH_BACKPRESSURE_RECOVERY_MS = 3_000;
 
+  private droppedInputs = 0;
+
   constructor(private readonly url: string) {
     document.addEventListener("visibilitychange", this.visibilityListener);
+    touchDiag.registerState("ws", () => {
+      const socket = this.socket;
+      const readyState = socket ? ["CONNECTING", "OPEN", "CLOSING", "CLOSED"][socket.readyState] ?? "?" : "none";
+      return {
+        st: readyState,
+        buf: socket?.bufferedAmount ?? 0,
+        snapAge: Math.round(performance.now() - this.lastAcceptedSnapshotAt),
+        drop: this.droppedInputs
+      };
+    });
   }
 
   connect(name: string, classId: CharacterClass, characterId?: string, token?: string, race?: CharacterRace, face?: number, customHeadUrl?: string, profile?: ClientPerformanceProfile): void {
@@ -397,10 +410,18 @@ export class RealtimeClient {
     const socket = this.socket;
     if (socket?.readyState === WebSocket.OPEN) {
       if (message.type === "input" && socket.bufferedAmount > RealtimeClient.INPUT_BACKPRESSURE_BYTES) {
+        this.droppedInputs += 1;
         return;
       }
       socket.send(JSON.stringify(message));
+      return;
     }
+
+    // Attack/skill/interaction commands are silently lost while the socket is
+    // not OPEN (for example during a watchdog-triggered reconnect). That window
+    // looks exactly like "the game runs but taps do nothing", so record it.
+    this.droppedInputs += 1;
+    touchDiag.event(`ws DROP ${message.type} (${socket ? socket.readyState : "no socket"})`);
   }
 
   private handleMessage(raw: string): void {
@@ -755,6 +776,7 @@ export class RealtimeClient {
       return;
     }
 
+    touchDiag.event(`ws RECOVER: ${reason}`);
     const joined = this.joined;
     const staleSocket = this.socket;
     this.socket = undefined;

@@ -47,6 +47,7 @@ import {
   type MonsterSpriteState
 } from "./monsterSpriteAssets";
 import { defaultMobileGraphicsSettings, isMobileGameRuntime, normalizeMobileGraphicsSettings, type MobileGraphicsSettings } from "./performanceSettings";
+import { touchDiag } from "./touchDiagnostics";
 import {
   WORLD_FOLIAGE_ATLAS_KEY,
   preloadWorldFoliageAssets,
@@ -850,6 +851,7 @@ export class WorldScene extends Phaser.Scene {
       WORLD_BOUNDS.width + WorldScene.CAMERA_EDGE_PADDING * 2,
       WORLD_BOUNDS.height + WorldScene.CAMERA_EDGE_PADDING * 2
     );
+    this.startTouchDiagnostics();
     this.mobileAutoTarget = this.loadMobileAutoTarget();
     this.setMobileGraphicsSettings(this.mobileGraphics);
     this.createWorldTextures();
@@ -909,6 +911,7 @@ export class WorldScene extends Phaser.Scene {
   }
 
   update(time: number): void {
+    touchDiag.noteFrame();
     const mobile = this.isMobileTouchMode();
     if (mobile) {
       this.updateMobileRuntimeBudget(time);
@@ -7879,11 +7882,14 @@ export class WorldScene extends Phaser.Scene {
     this.input.on("pointerdown", (pointer: Phaser.Input.Pointer) => {
       this.resumeAudio();
       if (this.isInputBlocked()) {
+        touchDiag.phaserPointerDown("BLOCKED(ui)");
         return;
       }
       if (this.isTouchControl(pointer)) {
+        touchDiag.phaserPointerDown("touchControl");
         return;
       }
+      touchDiag.phaserPointerDown(`world id=${pointer.id}`);
       const aim = this.screenToWorldAim({ x: pointer.x, y: pointer.y });
       if (this.shouldIgnoreMobileWorldTap(aim.x, aim.y, pointer)) {
         this.clearMoveIntent();
@@ -8001,6 +8007,31 @@ export class WorldScene extends Phaser.Scene {
       this.removeWindowInputGuards = undefined;
       this.clearWorldCursor();
     });
+  }
+
+  private startTouchDiagnostics(): void {
+    if (!touchDiag.enabled) {
+      return;
+    }
+
+    touchDiag.start();
+    touchDiag.registerState("scene", () => {
+      const active = document.activeElement;
+      const pointers = [this.input.mousePointer, ...(this.input.manager?.pointers ?? [])].filter(Boolean);
+      const down = pointers.filter((pointer) => pointer?.isDown).length;
+      return {
+        susp: this.inputSuspended ? 1 : 0,
+        hid: document.hidden ? 1 : 0,
+        uiF: this.uiFocused ? 1 : 0,
+        blk: this.isInputBlocked() ? 1 : 0,
+        act: active instanceof HTMLElement ? active.tagName.toLowerCase() : "-",
+        joy: `${this.joystick?.pointerId ?? "-"}/${this.joystick?.nativeTouchId ?? "-"}`,
+        aim: `${this.aimJoystick?.pointerId ?? "-"}/${this.aimJoystick?.nativeTouchId ?? "-"}`,
+        tap: this.pendingNativeWorldTap ? `${this.pendingNativeWorldTap.id}${this.pendingNativeWorldTap.moved ? "m" : ""}` : "-",
+        ptr: `${down}/${pointers.length}`
+      };
+    });
+    this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => touchDiag.stop());
   }
 
   private suspendLocalInput(): void {
@@ -8960,9 +8991,13 @@ export class WorldScene extends Phaser.Scene {
         const point = toCanvasPoint(touch.clientX, touch.clientY);
         if (startJoystick(point, touch.identifier, touch.identifier)) {
           handled = true;
+          touchDiag.canvasTouch("start", `id=${touch.identifier} joy`);
         } else if (startNativeWorldTap(point, touch.identifier)) {
           // Let normal browser/Phaser touch flow continue. This is only a fallback
           // if Phaser does not emit the world pointerdown for this tap.
+          touchDiag.canvasTouch("start", `id=${touch.identifier} tap`);
+        } else {
+          touchDiag.canvasTouch("start", `id=${touch.identifier} none`);
         }
       }
 
@@ -8972,6 +9007,7 @@ export class WorldScene extends Phaser.Scene {
       }
     };
     const onTouchMove = (event: TouchEvent) => {
+      touchDiag.canvasTouch("move", "");
       let handled = false;
       for (let index = 0; index < event.changedTouches.length; index += 1) {
         const touch = event.changedTouches.item(index);
@@ -9004,12 +9040,14 @@ export class WorldScene extends Phaser.Scene {
         }
       }
 
+      touchDiag.canvasTouch("end", `n=${event.changedTouches.length} h=${handled ? 1 : 0}`);
       if (handled) {
         event.preventDefault();
         event.stopPropagation();
       }
     };
     const onTouchCancel = (event: TouchEvent) => {
+      touchDiag.canvasTouch("cancel", `n=${event.changedTouches.length}`);
       let handled = false;
       if (this.joystick?.nativeTouchId !== undefined && touchById(event.changedTouches, this.joystick.nativeTouchId)) {
         this.releaseJoystick();
