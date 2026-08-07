@@ -65,6 +65,7 @@ import {
 	  type WorldHazardDefinition,
 	  type WorldResource
 	} from "@mmo/shared";
+import { TelegramNotifier } from "./telegram-notifier.js";
 
 interface PlayerPrivateState extends PlayerPublicState {
   characterId: string;
@@ -1941,6 +1942,7 @@ export class WorldService {
   private readonly pvpXpPairRecords = new Map<string, number>();
   private readonly pvpXpTargetLocks = new Map<string, number>();
   private readonly hazardDamageReadyAt = new Map<string, number>();
+  private readonly telegram = new TelegramNotifier();
   private readonly persistedCharacters = new Map<string, PersistedCharacter>();
   private readonly savePath = join(process.cwd(), "data", "characters.json");
   private readonly clansPath = join(process.cwd(), "data", "clans.json");
@@ -2125,6 +2127,14 @@ export class WorldService {
     }
 
     this.players.set(id, player);
+    this.telegram.playerJoined({
+      name: player.name,
+      characterId,
+      classLabel: classDef.label,
+      level: player.level,
+      returning: Boolean(saved),
+      realOnline: this.realOnlineCount()
+    });
     this.event(id, id, 0, "loot", `${player.name} entered the world.`);
     const pendingMarketNotices = [...(player.pendingMarketNotices ?? [])];
     player.pendingMarketNotices = [];
@@ -2953,6 +2963,12 @@ export class WorldService {
   isAdmin(playerId: string): boolean {
     const player = this.players.get(playerId);
     return Boolean(player && WorldService.ADMIN_NAME_KEYS.has(this.nameKey(player.name)));
+  }
+
+  private realOnlineCount(): number {
+    return [...this.players.values()].filter(
+      (player) => !this.botBrains.has(player.id) && !player.offlineMarketSeller
+    ).length;
   }
 
   adminState(playerId: string, message?: string): AdminState | undefined {
