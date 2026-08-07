@@ -57,6 +57,7 @@ interface FreezeRecord {
   fpsDuring: number;
   gestures: number;
   cancels: number;
+  pointers: number;
   scale: string;
 }
 
@@ -87,6 +88,8 @@ class TouchDiagnostics {
   private gesturesAtLastDocTouch = 0;
   private cancelsAtLastDocTouch = 0;
   private gestureCount = 0;
+  private pointerDownCount = 0;
+  private pointersAtLastDocTouch = 0;
   private readonly recentDocStarts: number[] = [];
   private worstFreeze?: FreezeRecord;
   private lastFreeze?: FreezeRecord;
@@ -104,6 +107,10 @@ class TouchDiagnostics {
     document.addEventListener("touchstart", this.onDocTouchStart, { passive: true, capture: true });
     document.addEventListener("touchend", this.onDocTouchEnd, { passive: true, capture: true });
     document.addEventListener("touchcancel", this.onDocTouchCancel, { passive: true, capture: true });
+    // Pointer events come down a different WebKit path than touch events. If a
+    // freeze shows pointerdowns arriving while touchstarts do not, Safari is
+    // suppressing touch events specifically rather than ignoring the finger.
+    document.addEventListener("pointerdown", this.onDocPointerDown, { passive: true, capture: true });
     window.addEventListener("blur", this.onBlur);
     window.addEventListener("focus", this.onFocus);
     document.addEventListener("visibilitychange", this.onVisibility);
@@ -256,6 +263,10 @@ class TouchDiagnostics {
     this.event(`doc CANCEL n=${event.touches.length}`);
   };
 
+  private readonly onDocPointerDown = () => {
+    this.pointerDownCount += 1;
+  };
+
   private readonly onGesture = (event: Event) => {
     this.gestureCount += 1;
     const scale = (event as Event & { scale?: number }).scale;
@@ -272,6 +283,7 @@ class TouchDiagnostics {
     this.framesAtLastDocTouch = this.totalFrames;
     this.gesturesAtLastDocTouch = this.gestureCount;
     this.cancelsAtLastDocTouch = this.counts.docCancel;
+    this.pointersAtLastDocTouch = this.pointerDownCount;
   }
 
   // Called on a fresh touchstart: measures the silence that just ended. Frames
@@ -306,6 +318,7 @@ class TouchDiagnostics {
       fpsDuring: Math.round((frames * 1000) / gapMs),
       gestures: this.gestureCount - this.gesturesAtLastDocTouch,
       cancels: this.counts.docCancel - this.cancelsAtLastDocTouch,
+      pointers: this.pointerDownCount - this.pointersAtLastDocTouch,
       scale: window.visualViewport ? window.visualViewport.scale.toFixed(2) : "-"
     };
     this.freezeCount += 1;
@@ -320,7 +333,7 @@ class TouchDiagnostics {
     if (!record) {
       return `${label}: none`;
     }
-    return `${label}: ${Math.round(record.gapMs)}ms frames=${record.frames} ${record.fpsDuring}fps gest=${record.gestures} cnc=${record.cancels} sc=${record.scale} ${((now - record.at) / 1000).toFixed(0)}s ago`;
+    return `${label}: ${Math.round(record.gapMs)}ms fr=${record.frames} ${record.fpsDuring}fps gest=${record.gestures} pd=${record.pointers} cnc=${record.cancels} sc=${record.scale} ${((now - record.at) / 1000).toFixed(0)}s ago`;
   }
 
   private readonly onBlur = () => this.event("window blur");
@@ -343,7 +356,7 @@ class TouchDiagnostics {
     lines.push(
       `cv s/m/e/c ${this.counts.canvasStart}/${this.counts.canvasMove}/${this.counts.canvasEnd}/${this.counts.canvasCancel}  ph ${this.counts.phaserDown}  hud ${this.counts.hud}`
     );
-    lines.push(`freezes ${this.freezeCount}  iOSgesture ${this.gestureCount}`);
+    lines.push(`freezes ${this.freezeCount}  iOSgesture ${this.gestureCount}  pd ${this.pointerDownCount}`);
     lines.push(this.describeFreeze("WORST", this.worstFreeze, now));
     lines.push(this.describeFreeze("LAST ", this.lastFreeze, now));
 
@@ -377,6 +390,7 @@ class TouchDiagnostics {
     document.removeEventListener("touchstart", this.onDocTouchStart, true);
     document.removeEventListener("touchend", this.onDocTouchEnd, true);
     document.removeEventListener("touchcancel", this.onDocTouchCancel, true);
+    document.removeEventListener("pointerdown", this.onDocPointerDown, true);
     window.removeEventListener("blur", this.onBlur);
     window.removeEventListener("focus", this.onFocus);
     document.removeEventListener("visibilitychange", this.onVisibility);

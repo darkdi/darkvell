@@ -853,6 +853,7 @@ export class WorldScene extends Phaser.Scene {
       WORLD_BOUNDS.height + WorldScene.CAMERA_EDGE_PADDING * 2
     );
     this.startTouchDiagnostics();
+    this.installIosGestureGuards();
     this.mobileAutoTarget = this.loadMobileAutoTarget();
     this.setMobileGraphicsSettings(this.mobileGraphics);
     this.createWorldTextures();
@@ -8012,6 +8013,33 @@ export class WorldScene extends Phaser.Scene {
       this.removeWindowInputGuards?.();
       this.removeWindowInputGuards = undefined;
       this.clearWorldCursor();
+    });
+  }
+
+  // iOS Safari runs its pinch-gesture recognizer even though the viewport meta
+  // says `user-scalable=no` and the canvas says `touch-action: none`: the page
+  // never actually zooms (visualViewport.scale stays 1) but Safari stops
+  // delivering touch events to the page while it recognizes, which reads to the
+  // player as "the game runs but tapping is dead".
+  //
+  // Cancelling the gesture events themselves is the only thing that stops the
+  // recognizer. These handlers do nothing but preventDefault -- no capture
+  // phase, no stopPropagation, no input-state recovery -- so they cannot
+  // interfere with the joystick/world-tap paths.
+  private installIosGestureGuards(): void {
+    const cancelGesture = (event: Event) => {
+      event.preventDefault();
+      touchDiag.event(`gesture blocked ${event.type}`);
+    };
+
+    document.addEventListener("gesturestart", cancelGesture, { passive: false });
+    document.addEventListener("gesturechange", cancelGesture, { passive: false });
+    document.addEventListener("gestureend", cancelGesture, { passive: false });
+
+    this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
+      document.removeEventListener("gesturestart", cancelGesture);
+      document.removeEventListener("gesturechange", cancelGesture);
+      document.removeEventListener("gestureend", cancelGesture);
     });
   }
 
