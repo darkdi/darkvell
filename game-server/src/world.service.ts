@@ -2130,6 +2130,7 @@ export class WorldService {
     this.telegram.playerJoined({
       name: player.name,
       characterId,
+      classId: classDef.id,
       classLabel: classDef.label,
       level: player.level,
       returning: Boolean(saved),

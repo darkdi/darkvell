@@ -10,9 +10,20 @@ const RATE_WINDOW_MS = 60 * 60 * 1000;
 const MAX_PER_WINDOW = 20;
 const REQUEST_TIMEOUT_MS = 5_000;
 
+// CLASS_DEFINITIONS carries English labels for the client, but this message is
+// Russian everywhere else, so translate here rather than in shared data.
+const CLASS_LABELS_RU: Record<string, string> = {
+  warrior: "Воин",
+  assassin: "Ассасин",
+  mage: "Маг",
+  archer: "Лучник",
+  tank: "Танк"
+};
+
 export interface PlayerJoinedNotice {
   name: string;
   characterId: string;
+  classId: string;
   classLabel: string;
   level: number;
   returning: boolean;
@@ -54,9 +65,10 @@ export class TelegramNotifier {
     const missed = this.suppressed > 0 ? `\n(за последний час не показано ещё ${this.suppressed})` : "";
     this.suppressed = 0;
 
+    const className = CLASS_LABELS_RU[notice.classId] ?? notice.classLabel;
     void this.send(
       `${heading}: ${notice.name}\n` +
-        `${notice.classLabel} · ${notice.level} уровень\n` +
+        `${className} · ${notice.level} уровень\n` +
         `Реальных игроков онлайн: ${notice.realOnline}${missed}`
     );
   }
