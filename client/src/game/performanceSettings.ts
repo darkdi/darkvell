@@ -16,7 +16,10 @@ export type MobileGraphicsSettings = {
   mobileFullWorldMap: boolean;
 };
 
-export const mobileGraphicsStorageKey = "mmo.mobileGraphics.v8";
+// Bumped v8 -> v9 on 2026-08-07 so existing phones pick up the new default of a
+// full world map. Saved settings store every field explicitly, so without a new
+// key only brand new players would have seen the change.
+export const mobileGraphicsStorageKey = "mmo.mobileGraphics.v9";
 
 const highQualityWorldVisuals = {
   worldDecorations: true,
@@ -42,6 +45,14 @@ const leanWorldVisuals = {
 const stableFullTextureWorldVisuals = {
   ...leanWorldVisuals,
   desktopWorldTextures: true
+};
+
+// The default mobile look as of 2026-08-07: desktop-style world map on phones.
+// "cool" and "minimal" deliberately stay on the lean map -- they exist as the
+// escape hatch for phones that heat up or drop frames.
+const fullWorldMapVisuals = {
+  ...stableFullTextureWorldVisuals,
+  mobileFullWorldMap: true
 };
 
 export const mobileGraphicsPresets: Array<{ id: ClientGraphicsPreset; label: string; hint: string; settings: MobileGraphicsSettings }> = [
@@ -84,8 +95,8 @@ export const mobileGraphicsPresets: Array<{ id: ClientGraphicsPreset; label: str
   {
     id: "balanced",
     label: "Balanced 60",
-    hint: "60 FPS default: same world art, readable effects and crowd savings.",
-    settings: { preset: "balanced", fpsLimit: 60, ...stableFullTextureWorldVisuals, combatEffects: true, floatingText: true, playerLabels: true, showFps: false }
+    hint: "60 FPS default: full mobile world, readable effects and crowd savings.",
+    settings: { preset: "balanced", fpsLimit: 60, ...fullWorldMapVisuals, combatEffects: true, floatingText: true, playerLabels: true, showFps: false }
   },
   {
     id: "cool",
@@ -134,7 +145,7 @@ export function isMobileGameRuntime(width = window.innerWidth, height = window.i
 function ruStoreStartupSettings(): MobileGraphicsSettings {
   return {
     ...presetSettings("balanced"),
-    ...stableFullTextureWorldVisuals,
+    ...fullWorldMapVisuals,
     fpsLimit: 60,
     combatEffects: true,
     floatingText: true,
