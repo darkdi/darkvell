@@ -5,7 +5,10 @@
 // from the environment and is never logged, so failures report the HTTP status
 // rather than the request URL.
 
-const DEDUPE_MS = 30 * 60 * 1000;
+// A mobile client that blips its connection leaves and rejoins within seconds,
+// and that is not an arrival worth a message. Anything longer is treated as the
+// player genuinely coming back, so a break of a few minutes does notify.
+const RECONNECT_GRACE_MS = 90 * 1000;
 const RATE_WINDOW_MS = 60 * 60 * 1000;
 const MAX_PER_WINDOW = 20;
 const REQUEST_TIMEOUT_MS = 5_000;
@@ -35,9 +38,18 @@ export class TelegramNotifier {
   private readonly chatId = process.env.TELEGRAM_ADMIN_CHAT_ID?.trim();
   readonly enabled = Boolean(this.token && this.chatId);
 
-  private readonly lastNotifiedAt = new Map<string, number>();
+  private readonly lastLeftAt = new Map<string, number>();
+  private readonly announced = new Set<string>();
   private sentAt: number[] = [];
   private suppressed = 0;
+
+  /** Called when a character leaves the world, so a quick rejoin reads as a reconnect. */
+  playerLeft(characterId: string): void {
+    if (!this.enabled) {
+      return;
+    }
+    this.lastLeftAt.set(characterId, Date.now());
+  }
 
   playerJoined(notice: PlayerJoinedNotice): void {
     if (!this.enabled) {
@@ -45,14 +57,13 @@ export class TelegramNotifier {
     }
 
     const now = Date.now();
-    // Mobile clients reconnect often, and a reconnect is not a new arrival.
-    const previous = this.lastNotifiedAt.get(notice.characterId);
-    if (previous !== undefined && now - previous < DEDUPE_MS) {
-      this.lastNotifiedAt.set(notice.characterId, now);
+    const leftAt = this.lastLeftAt.get(notice.characterId);
+    const reconnect = leftAt !== undefined && now - leftAt < RECONNECT_GRACE_MS;
+    if (reconnect && this.announced.has(notice.characterId)) {
       return;
     }
-    this.lastNotifiedAt.set(notice.characterId, now);
-    this.pruneDedupe(now);
+    this.announced.add(notice.characterId);
+    this.prune(now);
 
     this.sentAt = this.sentAt.filter((at) => now - at < RATE_WINDOW_MS);
     if (this.sentAt.length >= MAX_PER_WINDOW) {
@@ -73,13 +84,14 @@ export class TelegramNotifier {
     );
   }
 
-  private pruneDedupe(now: number): void {
-    if (this.lastNotifiedAt.size < 500) {
+  private prune(now: number): void {
+    if (this.lastLeftAt.size < 500) {
       return;
     }
-    for (const [characterId, at] of this.lastNotifiedAt) {
-      if (now - at >= DEDUPE_MS) {
-        this.lastNotifiedAt.delete(characterId);
+    for (const [characterId, at] of this.lastLeftAt) {
+      if (now - at >= RECONNECT_GRACE_MS) {
+        this.lastLeftAt.delete(characterId);
+        this.announced.delete(characterId);
       }
     }
   }

@@ -2190,6 +2190,9 @@ export class WorldService {
       return;
     }
 
+    // Recorded before any early return below, so a rejoin can tell a brief
+    // reconnect apart from the player actually coming back later.
+    this.telegram.playerLeft(player.characterId);
     this.cancelTradeFor(player.id, true);
     this.clearSocialState(playerId);
     for (const key of [...this.hazardDamageReadyAt.keys()]) {
