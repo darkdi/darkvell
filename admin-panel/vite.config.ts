@@ -6,6 +6,10 @@ const authTarget = process.env.VITE_DEV_AUTH_TARGET ?? "http://localhost:3200";
 const blockchainTarget = process.env.VITE_DEV_BLOCKCHAIN_TARGET ?? "http://localhost:3300";
 
 export default defineConfig({
+  // Served from https://darkvell.ru/admin/ in production. Without this the built
+  // asset URLs would point at /assets/, which nginx maps to the game client's
+  // own hashed bundles.
+  base: "/admin/",
   plugins: [react()],
   server: {
     host: "0.0.0.0",

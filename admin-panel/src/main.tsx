@@ -2,8 +2,10 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import {
   Activity,
+  Clock,
   Coins,
   Database,
+  Ghost,
   LogOut,
   RefreshCw,
   Search,
@@ -41,6 +43,8 @@ interface CharacterRow {
   arenaLosses: number;
   inventoryCount: number;
   equipmentCount: number;
+  firstSeenAt?: number;
+  lastSeenAt?: number;
   accountLogin?: string;
   accountCreatedAt?: string;
   registered: boolean;
@@ -52,10 +56,37 @@ interface CharacterDirectory {
     total: number;
     registered: number;
     withoutAccount: number;
+    activeLast24h: number;
+    activeLast7d: number;
     maxLevel: number;
     totalGold: number;
   };
   characters: CharacterRow[];
+}
+
+// Characters saved before last-seen tracking landed have no timestamp, which is
+// different from "never played" and should not be shown as a date.
+function formatSeen(at?: number): { text: string; stale: boolean } {
+  if (!at) {
+    return { text: "—", stale: true };
+  }
+
+  const minutes = Math.floor((Date.now() - at) / 60_000);
+  if (minutes < 1) {
+    return { text: "только что", stale: false };
+  }
+  if (minutes < 60) {
+    return { text: `${minutes} мин назад`, stale: false };
+  }
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    return { text: `${hours} ч назад`, stale: false };
+  }
+  const days = Math.floor(hours / 24);
+  if (days < 30) {
+    return { text: `${days} дн назад`, stale: days > 7 };
+  }
+  return { text: new Date(at).toLocaleDateString("ru-RU"), stale: true };
 }
 
 interface LoginResponse {
@@ -283,7 +314,10 @@ function App() {
       <section className="content">
         <div className="summaryGrid">
           <SummaryCard icon={<Users />} label="Всего персонажей" value={number.format(directory?.summary.total ?? 0)} />
-          <SummaryCard icon={<UserRound />} label="С аккаунтом" value={number.format(directory?.summary.registered ?? 0)} accent="blue" />
+          <SummaryCard icon={<UserRound />} label="Зарегались" value={number.format(directory?.summary.registered ?? 0)} accent="blue" />
+          <SummaryCard icon={<Ghost />} label="Гости, без аккаунта" value={number.format(directory?.summary.withoutAccount ?? 0)} accent="violet" />
+          <SummaryCard icon={<Activity />} label="Заходили за сутки" value={number.format(directory?.summary.activeLast24h ?? 0)} accent="green" />
+          <SummaryCard icon={<Clock />} label="Заходили за неделю" value={number.format(directory?.summary.activeLast7d ?? 0)} accent="blue" />
           <SummaryCard icon={<Swords />} label="Максимальный уровень" value={number.format(directory?.summary.maxLevel ?? 0)} accent="violet" />
           <SummaryCard icon={<Coins />} label="Золото у игроков" value={number.format(directory?.summary.totalGold ?? 0)} accent="gold" />
         </div>
@@ -313,7 +347,7 @@ function App() {
             <div className="filterTabs">
               <button className={accountFilter === "all" ? "active" : ""} onClick={() => setAccountFilter("all")}>Все</button>
               <button className={accountFilter === "registered" ? "active" : ""} onClick={() => setAccountFilter("registered")}>С аккаунтом</button>
-              <button className={accountFilter === "without" ? "active" : ""} onClick={() => setAccountFilter("without")}>Без аккаунта</button>
+              <button className={accountFilter === "without" ? "active" : ""} onClick={() => setAccountFilter("without")}>Гости</button>
             </div>
           </div>
 
@@ -328,28 +362,33 @@ function App() {
                     <th>Уровень</th>
                     <th>Класс</th>
                     <th>Аккаунт / email</th>
+                    <th>Последний вход</th>
                     <th>Золото</th>
                     <th>Арена</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {filteredCharacters.map((character) => (
-                    <tr key={character.characterId} onClick={() => setSelected(character)}>
-                      <td>
-                        <div className="characterCell">
-                          <span className={`avatar class-${character.classId}`}>{character.name.slice(0, 1).toUpperCase()}</span>
-                          <div><strong>{character.name}</strong><small>{raceNames[character.race] ?? character.race}</small></div>
-                        </div>
-                      </td>
-                      <td><span className="levelBadge">{character.level}</span></td>
-                      <td>{classNames[character.classId] ?? character.classId}</td>
-                      <td>
-                        {character.accountLogin ? <span className="accountLogin">{character.accountLogin}</span> : <span className="muted">Не привязан</span>}
-                      </td>
-                      <td>{number.format(character.gold)}</td>
-                      <td>{number.format(character.arenaRating)}</td>
-                    </tr>
-                  ))}
+                  {filteredCharacters.map((character) => {
+                    const seen = formatSeen(character.lastSeenAt);
+                    return (
+                      <tr key={character.characterId} onClick={() => setSelected(character)}>
+                        <td>
+                          <div className="characterCell">
+                            <span className={`avatar class-${character.classId}`}>{character.name.slice(0, 1).toUpperCase()}</span>
+                            <div><strong>{character.name}</strong><small>{raceNames[character.race] ?? character.race}</small></div>
+                          </div>
+                        </td>
+                        <td><span className="levelBadge">{character.level}</span></td>
+                        <td>{classNames[character.classId] ?? character.classId}</td>
+                        <td>
+                          {character.accountLogin ? <span className="accountLogin">{character.accountLogin}</span> : <span className="muted">Гость</span>}
+                        </td>
+                        <td className={seen.stale ? "muted" : undefined}>{seen.text}</td>
+                        <td>{number.format(character.gold)}</td>
+                        <td>{number.format(character.arenaRating)}</td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
               {!loading && filteredCharacters.length === 0 ? <div className="emptyState">Ничего не найдено</div> : null}
@@ -401,8 +440,22 @@ function CharacterDetails({ character, onClose }: { character: CharacterRow; onC
           <Database size={19} />
           <div>
             <span>Аккаунт / email</span>
-            <strong>{character.accountLogin ?? "Не привязан"}</strong>
-            {character.accountCreatedAt ? <small>Создан {new Date(character.accountCreatedAt).toLocaleDateString("ru-RU")}</small> : null}
+            <strong>{character.accountLogin ?? "Гость, аккаунта нет"}</strong>
+            {character.accountCreatedAt ? <small>Зарегался {new Date(character.accountCreatedAt).toLocaleDateString("ru-RU")}</small> : null}
+          </div>
+        </div>
+        <div className="accountCard">
+          <Clock size={19} />
+          <div>
+            <span>Игровая активность</span>
+            <strong>
+              {character.lastSeenAt ? `Последний вход: ${new Date(character.lastSeenAt).toLocaleString("ru-RU")}` : "Последний вход неизвестен"}
+            </strong>
+            <small>
+              {character.firstSeenAt
+                ? `Первый вход: ${new Date(character.firstSeenAt).toLocaleString("ru-RU")}`
+                : "Персонаж создан до того, как включили учёт входов"}
+            </small>
           </div>
         </div>
         <div className="idLine"><span>ID</span><code>{character.characterId}</code></div>

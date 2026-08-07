@@ -212,6 +212,11 @@ interface PersistedCharacter {
   marketVendorSinceAt?: number;
   marketNotices?: string[];
   wallet: WalletState;
+  // Owner-facing bookkeeping for the admin directory: when this character was
+  // first persisted and when it last played. Optional because characters saved
+  // before 2026-08-07 have neither.
+  firstSeenAt?: number;
+  lastSeenAt?: number;
 }
 
 interface PersistedModerationState {
@@ -11292,7 +11297,11 @@ export class WorldService {
     }
 
     const savedPosition = player.position;
+    const previous = this.persistedCharacters.get(player.characterId);
+    const savedAt = Date.now();
     this.persistedCharacters.set(player.characterId, {
+      firstSeenAt: previous?.firstSeenAt ?? savedAt,
+      lastSeenAt: savedAt,
       characterId: player.characterId,
       name: player.name,
       classId: player.classId,

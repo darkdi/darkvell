@@ -87,6 +87,8 @@ interface PersistedCharacterSummary {
   arenaLosses?: number;
   inventory?: unknown[];
   equipment?: Record<string, unknown>;
+  firstSeenAt?: number;
+  lastSeenAt?: number;
 }
 
 export interface AdminCharacterRow {
@@ -106,6 +108,8 @@ export interface AdminCharacterRow {
   arenaLosses: number;
   inventoryCount: number;
   equipmentCount: number;
+  firstSeenAt?: number;
+  lastSeenAt?: number;
   accountLogin?: string;
   accountCreatedAt?: string;
   registered: boolean;
@@ -320,7 +324,15 @@ export class AuthService {
 
   adminCharacters(token?: string): {
     generatedAt: string;
-    summary: { total: number; registered: number; withoutAccount: number; maxLevel: number; totalGold: number };
+    summary: {
+      total: number;
+      registered: number;
+      withoutAccount: number;
+      activeLast24h: number;
+      activeLast7d: number;
+      maxLevel: number;
+      totalGold: number;
+    };
     characters: AdminCharacterRow[];
   } {
     this.loadAccounts();
@@ -350,6 +362,8 @@ export class AuthService {
         inventoryCount: Array.isArray(saved.inventory) ? saved.inventory.length : 0,
         equipmentCount: saved.equipment ? Object.values(saved.equipment).filter(Boolean).length : 0,
         accountLogin: account?.login,
+        firstSeenAt: saved.firstSeenAt,
+        lastSeenAt: saved.lastSeenAt,
         accountCreatedAt: account?.createdAt,
         registered: Boolean(account)
       });
@@ -381,16 +395,29 @@ export class AuthService {
       });
     }
 
+    // Who played most recently is the question this directory is opened to
+    // answer, so it leads the ordering. Characters saved before last-seen
+    // tracking existed have no timestamp and fall to the bottom, still ordered
+    // by level.
     const characters = [...charactersById.values()].sort(
-      (left, right) => right.level - left.level || right.gold - left.gold || left.name.localeCompare(right.name)
+      (left, right) =>
+        (right.lastSeenAt ?? 0) - (left.lastSeenAt ?? 0) ||
+        right.level - left.level ||
+        right.gold - left.gold ||
+        left.name.localeCompare(right.name)
     );
     const registered = characters.filter((character) => character.registered).length;
+    const now = Date.now();
+    const activeSince = (windowMs: number) =>
+      characters.filter((character) => character.lastSeenAt !== undefined && now - character.lastSeenAt <= windowMs).length;
     return {
       generatedAt: new Date().toISOString(),
       summary: {
         total: characters.length,
         registered,
         withoutAccount: characters.length - registered,
+        activeLast24h: activeSince(24 * 60 * 60 * 1000),
+        activeLast7d: activeSince(7 * 24 * 60 * 60 * 1000),
         maxLevel: characters.reduce((max, character) => Math.max(max, character.level), 0),
         totalGold: characters.reduce((total, character) => total + character.gold, 0)
       },
