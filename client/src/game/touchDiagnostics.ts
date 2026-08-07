@@ -61,9 +61,13 @@ interface FreezeRecord {
   scale: string;
 }
 
-const FREEZE_MIN_GAP_MS = 600;
+const FREEZE_MIN_GAP_MS = 450;
 const FREEZE_BURST_WINDOW_MS = 2_500;
-const FREEZE_MIN_BURST_TAPS = 3;
+const FREEZE_MIN_BURST_TAPS = 2;
+// A finger resting perfectly still for this long during play is rare, so this
+// catches a dead-input window even when the player is holding the joystick
+// rather than tapping.
+const STUCK_FINGER_MS = 400;
 
 class TouchDiagnostics {
   readonly enabled = ENABLED;
@@ -94,6 +98,10 @@ class TouchDiagnostics {
   private worstFreeze?: FreezeRecord;
   private lastFreeze?: FreezeRecord;
   private freezeCount = 0;
+  private lastTouchActivityAt = 0;
+  private stuckReported = false;
+  private stuckCount = 0;
+  private worstStuckMs = 0;
 
   start(): void {
     if (!this.enabled || this.overlay) {
@@ -176,6 +184,7 @@ class TouchDiagnostics {
 
     this.totalFrames += 1;
     const now = performance.now();
+    this.checkStuckFinger(now);
     if (this.lastFrameAt > 0) {
       const delta = now - this.lastFrameAt;
       if (delta > STALL_THRESHOLD_MS) {
@@ -213,6 +222,7 @@ class TouchDiagnostics {
     }
     if (kind === "move") {
       this.counts.canvasMove += 1;
+      this.noteTouchActivity();
       return;
     }
     if (kind === "end") {
@@ -244,6 +254,7 @@ class TouchDiagnostics {
     this.counts.docStart += 1;
     this.activeTouches = event.touches.length;
     this.detectFreeze();
+    this.noteTouchActivity();
     this.noteDocTouch();
     this.recentDocStarts.push(performance.now());
     const target = event.target instanceof HTMLElement ? event.target.tagName.toLowerCase() : "?";
@@ -253,12 +264,14 @@ class TouchDiagnostics {
   private readonly onDocTouchEnd = (event: TouchEvent) => {
     this.counts.docEnd += 1;
     this.activeTouches = event.touches.length;
+    this.noteTouchActivity();
     this.noteDocTouch();
   };
 
   private readonly onDocTouchCancel = (event: TouchEvent) => {
     this.counts.docCancel += 1;
     this.activeTouches = event.touches.length;
+    this.noteTouchActivity();
     this.noteDocTouch();
     this.event(`doc CANCEL n=${event.touches.length}`);
   };
@@ -277,6 +290,33 @@ class TouchDiagnostics {
     const viewport = window.visualViewport;
     this.event(`viewport ${viewport?.width.toFixed(0)}x${viewport?.height.toFixed(0)} s=${viewport?.scale.toFixed(2)}`);
   };
+
+  // Rendering keeps running while this fires, so it isolates "the page stopped
+  // being given input" from "the game stopped drawing".
+  private checkStuckFinger(now: number): void {
+    if (this.activeTouches <= 0 || this.lastTouchActivityAt === 0) {
+      return;
+    }
+
+    const idle = now - this.lastTouchActivityAt;
+    if (idle < STUCK_FINGER_MS || this.stuckReported) {
+      return;
+    }
+
+    this.stuckReported = true;
+    this.stuckCount += 1;
+    this.event(`NO INPUT, ${this.activeTouches} finger(s) still down ${Math.round(idle)}ms`);
+  }
+
+  private noteTouchActivity(): void {
+    const now = performance.now();
+    if (this.stuckReported) {
+      this.worstStuckMs = Math.max(this.worstStuckMs, now - this.lastTouchActivityAt);
+      this.event(`input back after ${Math.round(now - this.lastTouchActivityAt)}ms`);
+    }
+    this.lastTouchActivityAt = now;
+    this.stuckReported = false;
+  }
 
   private noteDocTouch(): void {
     this.lastDocTouchAt = performance.now();
@@ -356,7 +396,9 @@ class TouchDiagnostics {
     lines.push(
       `cv s/m/e/c ${this.counts.canvasStart}/${this.counts.canvasMove}/${this.counts.canvasEnd}/${this.counts.canvasCancel}  ph ${this.counts.phaserDown}  hud ${this.counts.hud}`
     );
-    lines.push(`freezes ${this.freezeCount}  iOSgesture ${this.gestureCount}  pd ${this.pointerDownCount}`);
+    lines.push(
+      `freezes ${this.freezeCount}  deadWhileHeld ${this.stuckCount} (${Math.round(this.worstStuckMs)}ms)  iOSgest ${this.gestureCount}  pd ${this.pointerDownCount}`
+    );
     lines.push(this.describeFreeze("WORST", this.worstFreeze, now));
     lines.push(this.describeFreeze("LAST ", this.lastFreeze, now));
 
