@@ -64,6 +64,16 @@ interface CharacterDirectory {
   characters: CharacterRow[];
 }
 
+// Registration dates are absolute rather than relative: knowing someone signed
+// up on 3 августа is more useful in a roster than "4 дня назад".
+function formatRegistered(at: string): string {
+  const date = new Date(at);
+  if (Number.isNaN(date.getTime())) {
+    return "—";
+  }
+  return date.toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit", year: "2-digit" });
+}
+
 // Characters saved before last-seen tracking landed have no timestamp, which is
 // different from "never played" and should not be shown as a date.
 function formatSeen(at?: number): { text: string; stale: boolean } {
@@ -362,6 +372,7 @@ function App() {
                     <th>Уровень</th>
                     <th>Класс</th>
                     <th>Аккаунт / email</th>
+                    <th>Зарегался</th>
                     <th>Последний вход</th>
                     <th>Золото</th>
                     <th>Арена</th>
@@ -382,6 +393,9 @@ function App() {
                         <td>{classNames[character.classId] ?? character.classId}</td>
                         <td>
                           {character.accountLogin ? <span className="accountLogin">{character.accountLogin}</span> : <span className="muted">Гость</span>}
+                        </td>
+                        <td className={character.accountCreatedAt ? undefined : "muted"}>
+                          {character.accountCreatedAt ? formatRegistered(character.accountCreatedAt) : "—"}
                         </td>
                         <td className={seen.stale ? "muted" : undefined}>{seen.text}</td>
                         <td>{number.format(character.gold)}</td>

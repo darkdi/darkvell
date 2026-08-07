@@ -127,7 +127,7 @@ button:disabled { cursor: wait; opacity: .65; }
 .iconButton:hover { background: #1c2c25; }
 
 .content { margin: 0 auto; max-width: 1540px; padding: 30px clamp(18px, 4vw, 56px) 60px; }
-.summaryGrid { display: grid; gap: 14px; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.summaryGrid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
 .summaryCard {
   align-items: center;
   background: linear-gradient(145deg, rgba(16, 27, 22, .96), rgba(10, 17, 14, .96));
@@ -166,7 +166,7 @@ button:disabled { cursor: wait; opacity: .65; }
 .filterTabs button.active { background: #183326; color: #a7f3d0; }
 
 .tableWrap { min-height: 230px; overflow-x: auto; }
-table { border-collapse: collapse; min-width: 780px; width: 100%; }
+table { border-collapse: collapse; min-width: 900px; width: 100%; }
 th { color: #61796e; font-size: 10px; font-weight: 800; letter-spacing: 1px; padding: 12px 18px; text-align: left; text-transform: uppercase; }
 td { border-top: 1px solid #14221b; color: #c9dbd2; font-size: 13px; padding: 12px 18px; }
 tbody tr { cursor: pointer; transition: background .14s ease; }
