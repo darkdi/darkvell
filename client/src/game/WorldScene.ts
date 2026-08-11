@@ -41,11 +41,18 @@ import {
   monsterSpriteFrameName,
   monsterSpriteSkinFor,
   monsterSpriteStateDurationMs,
-  preloadMonsterSpriteAssets,
   requestMonsterSpriteAsset,
   type MonsterSpriteSkin,
   type MonsterSpriteState
 } from "./monsterSpriteAssets";
+import {
+  DARKVELL_CITY_ATLAS_KEY,
+  darkVellMonsterArtFor,
+  darkVellMonsterTexture,
+  preloadDarkVellOriginalAssets,
+  type DarkVellMonsterArt,
+  type DarkVellMonsterMotion
+} from "./darkVellOriginalAssets";
 import { defaultMobileGraphicsSettings, isMobileGameRuntime, normalizeMobileGraphicsSettings, type MobileGraphicsSettings } from "./performanceSettings";
 import { touchDiag } from "./touchDiagnostics";
 import {
@@ -95,6 +102,7 @@ type PlayerVisualMode = "full" | "simple" | "hidden";
 
 interface MonsterView {
   body: Phaser.GameObjects.Image;
+  originalArt?: DarkVellMonsterArt;
   spriteSkin?: MonsterSpriteSkin;
   animationState?: MonsterSpriteState;
   animationStartedAt: number;
@@ -110,6 +118,7 @@ interface MonsterView {
   velocity: Vector2;
   positionHistory: NetworkPositionSample[];
   facingAngle: number;
+  facingDirection: "up" | "down" | "left" | "right";
   idleSeed: number;
   lastServerAt: number;
   lastHp: number;
@@ -834,7 +843,7 @@ export class WorldScene extends Phaser.Scene {
     Object.values(CUSTOM_PLAYER_HEADS).forEach((head) => {
       this.load.image(head.texture, head.url);
     });
-    preloadMonsterSpriteAssets(this);
+    preloadDarkVellOriginalAssets(this);
     preloadWorldFoliageAssets(this);
   }
 
@@ -6239,7 +6248,6 @@ export class WorldScene extends Phaser.Scene {
         });
       }
 
-      const houseTextures = ["city-house", "city-house-blue", "city-house-green", "city-house-stone"] as const;
       const placeStructure = (texture: string, dx: number, dy: number, scale: number, rotation = 0, depth = 6) => {
         this.add
           .image(city.position.x + dx, city.position.y + dy, texture)
@@ -6247,63 +6255,80 @@ export class WorldScene extends Phaser.Scene {
           .setScale(scale)
           .setDepth(depth + dy * 0.0002);
       };
+      const placePaintedStructure = (frame: number, dx: number, dy: number, scale: number, rotation = 0, depth = 6) => {
+        this.add
+          .image(city.position.x + dx, city.position.y + dy, DARKVELL_CITY_ATLAS_KEY, frame)
+          .setOrigin(0.5, 0.82)
+          .setRotation(rotation)
+          .setScale(scale)
+          .setDepth(depth + dy * 0.0002);
+      };
+      const houseFrames = [0, 1, 4, 5] as const;
+      const residentialSlots = [
+        { x: -0.74, y: -0.42, rotation: -0.018 },
+        { x: 0.74, y: -0.42, rotation: 0.018 },
+        { x: -0.74, y: 0.42, rotation: 0.018 },
+        { x: 0.74, y: 0.42, rotation: -0.018 },
+        { x: -0.34, y: -0.49, rotation: -0.012 },
+        { x: 0.34, y: -0.49, rotation: 0.012 },
+        { x: -0.34, y: 0.49, rotation: 0.012 },
+        { x: 0.34, y: 0.49, rotation: -0.012 }
+      ] as const;
       const houseCount =
         isGrandCapital
-          ? 16
+          ? 8
           : isHub
-            ? 14
+            ? 6
             : city.kind === "harbor" || city.kind === "fortress"
-              ? 9
-              : city.kind === "village"
-                ? 8
-                : city.kind === "sanctum"
-                  ? 7
-                  : 5;
+              ? 6
+              : city.kind === "outpost"
+                ? 2
+                : 4;
       for (let index = 0; index < houseCount; index += 1) {
-        const angle = (index / houseCount) * Math.PI * 2 + (index % 2) * 0.18;
-        const radiusX = townRadius * (isMajorCapital ? 0.68 : 0.7) * (0.78 + (index % 3) * 0.08);
-        const radiusY = townRadius * (isMajorCapital ? 0.42 : 0.46) * (0.82 + (index % 4) * 0.05);
-        const dx = Math.cos(angle) * radiusX;
-        const dy = Math.sin(angle) * radiusY;
-        const texture = houseTextures[(index + city.recommendedLevel) % houseTextures.length];
+        const slot = residentialSlots[index];
+        const dx = townRadius * slot.x;
+        const dy = townRadius * slot.y;
+        const frame = houseFrames[(index + city.recommendedLevel) % houseFrames.length];
         const houseScale =
           isGrandCapital
-            ? 0.82
+            ? 0.51
             : isHub
-              ? 0.76
+              ? 0.48
               : city.kind === "outpost"
-                ? 0.52
+                ? 0.36
                 : city.kind === "sanctum"
-                  ? 0.58
-                  : 0.64;
-        placeStructure(texture, dx, dy, houseScale, angle * 0.06, 5.95);
+                  ? 0.39
+                  : city.kind === "fortress"
+                    ? 0.43
+                    : 0.41;
+        placePaintedStructure(frame, dx, dy, houseScale, slot.rotation, 5.95);
       }
 
       if (isMajorCapital) {
-        placeStructure("city-keep", 0, isGrandCapital ? -168 : -124, isGrandCapital ? 1.42 : 1.18, 0, 6.25);
-        placeStructure("city-market", -townRadius * 0.38, townRadius * 0.18, isGrandCapital ? 0.92 : 0.82, -0.04, 6.2);
-        placeStructure("city-shrine", townRadius * 0.4, townRadius * 0.16, isGrandCapital ? 0.84 : 0.72, 0.04, 6.2);
+        placePaintedStructure(2, 0, isGrandCapital ? -168 : -124, isGrandCapital ? 0.6 : 0.52, 0, 6.25);
+        placePaintedStructure(3, -townRadius * 0.38, townRadius * 0.18, isGrandCapital ? 0.5 : 0.45, -0.025, 6.2);
+        placePaintedStructure(6, townRadius * 0.4, townRadius * 0.16, isGrandCapital ? 0.47 : 0.41, 0.025, 6.2);
         placeStructure("city-fountain", 0, townRadius * 0.18, isGrandCapital ? 1.08 : 0.9, 0, 6.1);
-        placeStructure("city-tower", -townRadius * 0.52, -townRadius * 0.14, isGrandCapital ? 0.82 : 0.68, -0.05, 6.15);
-        placeStructure("city-tower", townRadius * 0.52, -townRadius * 0.14, isGrandCapital ? 0.82 : 0.68, 0.05, 6.15);
+        placePaintedStructure(7, -townRadius * 0.52, -townRadius * 0.14, isGrandCapital ? 0.46 : 0.4, -0.035, 6.15);
+        placePaintedStructure(7, townRadius * 0.52, -townRadius * 0.14, isGrandCapital ? 0.46 : 0.4, 0.035, 6.15);
         if (isGrandCapital) {
           placeStructure("city-gate", 0, townRadius * 0.56, 0.86, Math.PI, 6.24);
-          placeStructure("city-keep", -townRadius * 0.72, townRadius * 0.02, 0.82, -0.04, 6.18);
-          placeStructure("city-keep", townRadius * 0.72, townRadius * 0.02, 0.82, 0.04, 6.18);
+          placePaintedStructure(2, -townRadius * 0.72, townRadius * 0.02, 0.44, -0.03, 6.18);
+          placePaintedStructure(2, townRadius * 0.72, townRadius * 0.02, 0.44, 0.03, 6.18);
         }
       } else {
         if (city.kind === "sanctum") {
-          placeStructure("city-shrine", 0, -townRadius * 0.2, 0.82, 0, 6.22);
+          placePaintedStructure(6, 0, -townRadius * 0.2, 0.44, 0, 6.22);
           placeStructure("decor-obelisk", -townRadius * 0.36, townRadius * 0.1, 0.58, -0.05, 6.15);
           placeStructure("decor-obelisk", townRadius * 0.36, townRadius * 0.1, 0.58, 0.05, 6.15);
           placeStructure("city-fountain", 0, townRadius * 0.28, 0.5, 0, 6.1);
         } else {
-          placeStructure("city-keep", 0, -townRadius * 0.22, city.kind === "fortress" ? 0.92 : city.kind === "outpost" ? 0.68 : 0.8, 0, 6.2);
-          placeStructure("city-market", -townRadius * 0.38, townRadius * 0.18, city.kind === "outpost" ? 0.48 : 0.58, -0.04, 6.12);
+          placePaintedStructure(2, 0, -townRadius * 0.22, city.kind === "fortress" ? 0.5 : city.kind === "outpost" ? 0.38 : 0.44, 0, 6.2);
+          placePaintedStructure(3, -townRadius * 0.38, townRadius * 0.18, city.kind === "outpost" ? 0.3 : 0.35, -0.025, 6.12);
           placeStructure("city-fountain", townRadius * 0.34, townRadius * 0.18, city.kind === "outpost" ? 0.42 : 0.5, 0.03, 6.08);
         }
         if (city.kind !== "village") {
-          placeStructure("city-tower", 0, townRadius * 0.46, city.kind === "fortress" ? 0.66 : 0.58, 0, 6.14);
+          placePaintedStructure(7, 0, townRadius * 0.46, city.kind === "fortress" ? 0.4 : 0.35, 0, 6.14);
         }
       }
 
@@ -7656,37 +7681,44 @@ export class WorldScene extends Phaser.Scene {
                       : 0.46)
         )
       );
-      const radiusX = visualRadius * (isHub || isGrandCapital ? 0.72 : 0.68);
-      const radiusY = visualRadius * (isHub || isGrandCapital ? 0.46 : 0.43);
-      const propCount = isHub || isGrandCapital ? 9 : 5;
-      const houseTextures = ["city-house", "city-house-blue", "city-house-green", "city-house-stone"] as const;
+      const propSlots = [
+        { x: -0.7, y: -0.4 },
+        { x: 0.7, y: -0.4 },
+        { x: -0.7, y: 0.4 },
+        { x: 0.7, y: 0.4 },
+        { x: -0.28, y: -0.48 },
+        { x: 0.28, y: -0.48 }
+      ] as const;
+      const propCount = isHub || isGrandCapital ? 6 : city.kind === "outpost" ? 2 : 4;
+      const houseFrames = [0, 1, 4, 5] as const;
       for (let index = 0; index < propCount; index += 1) {
-        const angle = (index / propCount) * Math.PI * 2 + (city.position.x % 37) * 0.004;
-        const x = city.position.x + Math.cos(angle) * radiusX;
-        const y = city.position.y + Math.sin(angle) * radiusY;
-        const texture =
+        const slot = propSlots[index];
+        const angle = slot.x * 0.04;
+        const x = city.position.x + slot.x * visualRadius;
+        const y = city.position.y + slot.y * visualRadius;
+        const fallbackTexture =
           city.kind === "harbor" && index === propCount - 1
             ? "city-dock"
-            : city.kind === "sanctum" && index === 0
-              ? "decor-safe-shrine"
-              : city.kind === "outpost" && index === propCount - 1
+            : city.kind === "outpost" && index === propCount - 1
                 ? "city-tent"
-                : houseTextures[(index + city.recommendedLevel) % houseTextures.length];
-        const scale =
-          texture === "city-dock"
+                : undefined;
+        const frame = city.kind === "sanctum" && index === 0 ? 6 : houseFrames[(index + city.recommendedLevel) % houseFrames.length];
+        const scale = fallbackTexture
+          ? fallbackTexture === "city-dock"
             ? 0.5
-            : texture === "decor-safe-shrine"
-              ? 0.52
-              : texture === "city-tent"
+            : fallbackTexture === "city-tent"
                 ? 0.48
-                : isHub || isGrandCapital
-                  ? 0.54
-                  : 0.48;
-        this.add
-          .image(x, y, texture)
-          .setRotation(texture === "city-dock" ? angle + Math.PI / 2 : angle * 0.08)
+                : 0.48
+          : isHub || isGrandCapital
+            ? 0.35
+            : 0.31;
+        const prop = fallbackTexture
+          ? this.add.image(x, y, fallbackTexture)
+          : this.add.image(x, y, DARKVELL_CITY_ATLAS_KEY, frame).setOrigin(0.5, 0.82);
+        prop
+          .setRotation(fallbackTexture === "city-dock" ? angle + Math.PI / 2 : angle * 0.055)
           .setScale(scale)
-          .setAlpha(0.82)
+          .setAlpha(fallbackTexture ? 0.82 : 0.9)
           .setDepth(6.36 + y * 0.00014);
       }
     };
@@ -12552,11 +12584,19 @@ export class WorldScene extends Phaser.Scene {
     let view = this.monsters.get(monster.id);
     const size = this.monsterDrawSize(monster);
     const serverTime = this.snapshot?.serverTime ?? Date.now();
-    const loadedSpriteSkin = this.loadedMonsterSpriteSkin(monster);
-    if (!loadedSpriteSkin && monster.spritePackId && this.isPositionNearCamera(monster.position, 720)) {
+    const originalArt = darkVellMonsterArtFor(monster.archetype);
+    const loadedSpriteSkin = originalArt ? undefined : this.loadedMonsterSpriteSkin(monster);
+    if (!originalArt && !loadedSpriteSkin && monster.spritePackId && this.isPositionNearCamera(monster.position, 720)) {
       requestMonsterSpriteAsset(this, monster.spritePackId);
     }
-    if (view && !view.spriteSkin && loadedSpriteSkin) {
+    if (view && !view.originalArt && originalArt) {
+      view.originalArt = originalArt;
+      view.spriteSkin = undefined;
+      view.animationState = "idle";
+      view.animationStartedAt = this.time.now;
+      view.lastAnimationFrame = "";
+      view.body.setTexture(originalArt.idleTexture, originalArt.frame).setOrigin(0.5, originalArt.originY);
+    } else if (view && !view.originalArt && !view.spriteSkin && loadedSpriteSkin) {
       view.spriteSkin = loadedSpriteSkin;
       view.animationState = "idle";
       view.animationStartedAt = this.time.now;
@@ -12564,24 +12604,34 @@ export class WorldScene extends Phaser.Scene {
       view.body.setTexture(loadedSpriteSkin.atlasKey, monsterSpriteFrameName(loadedSpriteSkin, "idle", 0));
     }
     if (!view) {
-      const spriteSkin = loadedSpriteSkin;
+      const spriteSkin = originalArt ? undefined : loadedSpriteSkin;
       const initialFrame = spriteSkin
         ? monsterSpriteFrameName(spriteSkin, "idle", this.stableHash(`${monster.id}:idle-frame`) % monsterSpriteFrameCount(spriteSkin, "idle"))
         : undefined;
       const animationStartedAt = this.time.now - (this.stableHash(`${monster.id}:idle-phase`) % monsterSpriteStateDurationMs("idle", spriteSkin));
+      const body = this.add
+        .image(
+          monster.position.x,
+          monster.position.y,
+          originalArt?.idleTexture ?? spriteSkin?.atlasKey ?? this.monsterTexture(monster),
+          originalArt?.frame ?? initialFrame
+        )
+        .setDepth(8)
+        .setDisplaySize(size.width, size.height);
+      if (originalArt) {
+        body.setOrigin(0.5, originalArt.originY);
+      }
       view = {
-        body: this.add
-          .image(monster.position.x, monster.position.y, spriteSkin?.atlasKey ?? this.monsterTexture(monster), initialFrame)
-          .setDepth(8)
-          .setDisplaySize(size.width, size.height),
+        body,
+        originalArt,
         spriteSkin,
-        animationState: spriteSkin ? "idle" : undefined,
+        animationState: originalArt || spriteSkin ? "idle" : undefined,
         animationStartedAt,
         lastAnimationFrame: initialFrame ?? "",
         lastAnimatedAttackCueAt: Number.NEGATIVE_INFINITY,
         lastHitCueAt: Number.NEGATIVE_INFINITY,
         diedAt: 0,
-        feet: this.createMonsterFeet(monster),
+        feet: this.createMonsterFeet(monster, Boolean(originalArt || spriteSkin)),
         label: this.add
           .text(monster.position.x, monster.position.y - size.height / 2 - 14, this.nameWithLevel(this.monsterDisplayName(monster), monster.level), {
             color: "#f8fafc",
@@ -12596,6 +12646,7 @@ export class WorldScene extends Phaser.Scene {
         velocity: monster.velocity ?? { x: 0, y: 0 },
         positionHistory: [{ position: { ...monster.position }, serverTime }],
         facingAngle: 0,
+        facingDirection: "left",
         idleSeed: this.stableHash(monster.id) * 0.01,
         lastServerAt: this.time.now,
         lastHp: monster.hp,
@@ -12795,8 +12846,11 @@ export class WorldScene extends Phaser.Scene {
   private positionMonsterView(view: MonsterView, monster: MonsterState, position: Vector2): void {
     const size = this.monsterDrawSize(monster);
     const variant = this.monsterVisualVariant(monster);
-    const spriteHeight = size.height * variant.scale * (view.spriteSkin?.heightScale ?? 1);
-    const visualSize = view.spriteSkin
+    const artwork = view.originalArt;
+    const spriteHeight = size.height * variant.scale * (artwork?.heightScale ?? view.spriteSkin?.heightScale ?? 1);
+    const visualSize = artwork
+      ? { width: size.width * variant.scale * artwork.widthScale, height: spriteHeight }
+      : view.spriteSkin
       ? { width: spriteHeight * view.spriteSkin.aspectRatio, height: spriteHeight }
       : { width: size.width * variant.scale, height: spriteHeight };
     const cullMargin = this.isMobileTouchMode()
@@ -12825,8 +12879,12 @@ export class WorldScene extends Phaser.Scene {
     const nextFaceAngle = Math.atan2(faceVector.y, faceVector.x);
     const faceAngle = Number.isFinite(nextFaceAngle) && (target || speed > 2) ? nextFaceAngle : view.facingAngle;
     view.facingAngle = Number.isFinite(faceAngle) ? faceAngle : 0;
+    if ((target || moving) && Math.hypot(faceVector.x, faceVector.y) > 2) {
+      view.facingDirection = this.darkVellMonsterDirection(faceVector);
+    }
     const attackAge = this.time.now - view.lastAttackCueAt;
-    const attackPulse = alive && attackAge >= 0 && attackAge < 260 ? Math.sin((1 - attackAge / 260) * Math.PI) : 0;
+    const attackDuration = artwork ? 560 : 260;
+    const attackPulse = alive && attackAge >= 0 && attackAge < attackDuration ? Math.sin((attackAge / attackDuration) * Math.PI) : 0;
     const hitAge = this.time.now - view.lastHitCueAt;
     const hitPulse = alive && hitAge >= 0 && hitAge < 180 ? Math.sin((hitAge / 180) * Math.PI) : 0;
     const forward = { x: Math.cos(view.facingAngle), y: Math.sin(view.facingAngle) };
@@ -12835,25 +12893,48 @@ export class WorldScene extends Phaser.Scene {
     const phase = this.time.now / (moving && attackPulse <= 0 ? walkRate : 320) + view.idleSeed;
     const idlePhase = this.time.now / 1000 + view.idleSeed;
     const attacking = attackPulse > 0;
-    const atlasBacked = this.updateMonsterSpriteFrame(view, monster, moving);
+    const atlasBacked = artwork ? this.updateDarkVellMonsterFrame(view, monster, moving) : this.updateMonsterSpriteFrame(view, monster, moving);
     const breathe = alive
-      ? 1 + Math.sin(idlePhase * 2.3) * (atlasBacked ? (moving && !attacking ? 0.003 : 0.007) : moving && !attacking ? 0.02 : 0.045)
+      ? 1 + Math.sin(idlePhase * 2.3) * (artwork ? (moving && !attacking ? 0.008 : 0.012) : atlasBacked ? (moving && !attacking ? 0.003 : 0.007) : moving && !attacking ? 0.02 : 0.045)
       : 1;
-    const bob = alive ? Math.sin(phase) * (atlasBacked ? (moving && !attacking ? 0.48 : 0.24) : moving && !attacking ? 2.35 : 0.9) : 0;
+    const bob = alive ? Math.sin(phase) * (artwork ? (moving && !attacking ? 1.2 : 0.42) : atlasBacked ? (moving && !attacking ? 0.48 : 0.24) : moving && !attacking ? 2.35 : 0.9) : 0;
     const idleSide = !moving && alive ? Math.sin(idlePhase * 1.55) * (atlasBacked ? 0.2 : 0.8) : 0;
     const idleNod = !moving && alive ? Math.cos(idlePhase * 1.15) * (atlasBacked ? 0.12 : 0.45) : 0;
     const side = { x: -Math.sin(view.facingAngle), y: Math.cos(view.facingAngle) };
-    const rotation = atlasBacked
+    const directionLean = artwork && moving
+      ? view.facingDirection === "left"
+        ? -0.018
+        : view.facingDirection === "right"
+          ? 0.018
+          : view.facingDirection === "up"
+            ? -0.008
+            : 0.008
+      : 0;
+    const deathFall = artwork && !alive ? deathProgress * (view.body.flipX ? -1.12 : 1.12) : 0;
+    const rotation = artwork
+      ? directionLean + (alive ? Math.sin(phase) * (moving && !attacking ? 0.012 : 0.004) : 0) + attackPulse * 0.035 + deathFall
+      : atlasBacked
       ? (alive ? Math.sin(phase) * (moving && !attacking ? 0.006 : 0.003) : 0) + attackPulse * 0.012
       : view.facingAngle * 0.05 + (alive ? Math.sin(phase) * (moving && !attacking ? 0.035 : 0.02) : 0) + attackPulse * 0.08;
-    if (!atlasBacked && view.body.texture.key !== this.monsterTexture(monster)) {
+    if (!artwork && !atlasBacked && view.body.texture.key !== this.monsterTexture(monster)) {
       view.body.setTexture(this.monsterTexture(monster));
     }
-    const attackLunge = atlasBacked ? 4 : 8;
+    const attackLunge = artwork ? 11 : atlasBacked ? 4 : 8;
+    const gaitStretch = artwork && moving && !attacking ? Math.sin(phase) * 0.018 : 0;
+    const originalFlipX = artwork
+      ? view.facingDirection === "right"
+        ? true
+        : view.facingDirection === "left"
+          ? false
+          : view.body.flipX
+      : Math.cos(view.facingAngle) < 0;
+    if (artwork) {
+      view.body.setOrigin(0.5, artwork.originY);
+    }
     view.body
       .setDisplaySize(
-        visualSize.width * (breathe + attackPulse * 0.018 + hitPulse * 0.025) * spawnScale,
-        visualSize.height * (1 + (breathe - 1) * 0.7 - hitPulse * 0.035) * spawnScale
+        visualSize.width * (breathe - gaitStretch * 0.45 + attackPulse * (artwork ? 0.035 : 0.018) + hitPulse * 0.025) * spawnScale,
+        visualSize.height * (1 + (breathe - 1) * 0.7 + gaitStretch - hitPulse * 0.035 - deathProgress * (artwork ? 0.18 : 0)) * spawnScale
       )
       .setAlpha(alpha)
       .setPosition(
@@ -12861,7 +12942,7 @@ export class WorldScene extends Phaser.Scene {
         position.y + side.y * idleSide + bob + idleNod + forward.y * (attackPulse * attackLunge - hitPulse * 2.8) + (1 - spawnEase) * 10
       )
       .setRotation(rotation)
-      .setFlipX(Math.cos(view.facingAngle) < 0);
+      .setFlipX(originalFlipX);
     if (hitPulse > 0.08) {
       view.body.setTintFill(0xffe2c2);
     } else {
@@ -12888,8 +12969,9 @@ export class WorldScene extends Phaser.Scene {
     }
     // Pack 12 keeps a 128px bottom-pivot source canvas around a much shorter trimmed figure.
     // Anchor its metadata to the visible frame, otherwise the transparent top padding lifts it far above the head.
-    const bodyTop =
-      view.spriteSkin?.packId === 12 && view.body.frame.trimmed
+    const bodyTop = artwork
+      ? view.body.y - view.body.displayHeight * 0.62
+      : view.spriteSkin?.packId === 12 && view.body.frame.trimmed
         ? view.body.y + (view.body.frame.y - view.body.displayOriginY) * Math.abs(view.body.scaleY)
         : view.body.y - view.body.displayHeight * view.body.originY;
     view.label.setPosition(position.x, bodyTop - 14);
@@ -12897,6 +12979,54 @@ export class WorldScene extends Phaser.Scene {
     const hpWidth = visualSize.width * 0.72;
     view.hp.setPosition(position.x - (hpWidth - hpWidth * (monster.hp / monster.maxHp)) / 2, bodyTop - 8);
     view.hp.width = Math.max(1, hpWidth * (monster.hp / monster.maxHp));
+  }
+
+  private darkVellMonsterDirection(vector: Vector2): "up" | "down" | "left" | "right" {
+    if (Math.abs(vector.x) > Math.abs(vector.y) * 0.78) {
+      return vector.x >= 0 ? "right" : "left";
+    }
+    return vector.y >= 0 ? "down" : "up";
+  }
+
+  private updateDarkVellMonsterFrame(view: MonsterView, monster: MonsterState, moving: boolean): boolean {
+    const artwork = view.originalArt;
+    if (!artwork) {
+      return false;
+    }
+
+    const now = this.time.now;
+    const alive = monster.hp > 0;
+    const attackAge = now - view.lastAttackCueAt;
+    const attackActive = alive && attackAge >= 0 && attackAge < 560;
+    let motion: DarkVellMonsterMotion = "idle";
+    let state: MonsterSpriteState = alive ? "idle" : "death";
+
+    if (attackActive) {
+      state = "attack";
+      const attackProgress = attackAge / 560;
+      motion = attackProgress >= 0.14 && attackProgress <= 0.82 ? "attack" : "idle";
+    } else if (alive && moving) {
+      state = "move";
+      const mobileLowRate =
+        this.isMobileTouchMode() &&
+        monster.id !== this.selectedTargetId &&
+        (this.mobileLeanRuntime || this.mobileSustainedLeanRuntime || this.isCrowdedScene());
+      const sampledNow = mobileLowRate ? Math.floor(now / 100) * 100 : now;
+      const phase = Math.floor(((sampledNow + this.stableHash(monster.id)) % 480) / 120);
+      motion = phase === 1 ? "walkA" : phase === 3 ? "walkB" : "idle";
+      if (view.facingDirection === "up") {
+        motion = motion === "walkA" ? "walkB" : motion === "walkB" ? "walkA" : motion;
+      }
+    }
+
+    const texture = darkVellMonsterTexture(artwork, motion);
+    const frameKey = `${texture}:${artwork.frame}`;
+    if (frameKey !== view.lastAnimationFrame) {
+      view.body.setTexture(texture, artwork.frame);
+      view.lastAnimationFrame = frameKey;
+    }
+    view.animationState = state;
+    return true;
   }
 
   private loadedMonsterSpriteSkin(monster: MonsterState): MonsterSpriteSkin | undefined {
@@ -12983,8 +13113,8 @@ export class WorldScene extends Phaser.Scene {
     view.hp.setVisible(visible);
   }
 
-  private createMonsterFeet(monster: MonsterState): Phaser.GameObjects.Ellipse[] {
-    if (this.loadedMonsterSpriteSkin(monster)) {
+  private createMonsterFeet(monster: MonsterState, atlasBacked = Boolean(darkVellMonsterArtFor(monster.archetype) || this.loadedMonsterSpriteSkin(monster))): Phaser.GameObjects.Ellipse[] {
+    if (atlasBacked) {
       return [this.add.ellipse(monster.position.x, monster.position.y, 24, 8, 0x020617, 0.3).setDepth(7.7).setSmoothness(16)];
     }
     const color = this.monsterFootColor(monster);
@@ -13006,25 +13136,27 @@ export class WorldScene extends Phaser.Scene {
     moving: boolean,
     alpha: number
   ): void {
-    if (view.spriteSkin) {
+    if (view.originalArt || view.spriteSkin) {
       const shadow = view.feet[0];
       if (!shadow) {
         return;
       }
       view.feet.slice(1).forEach((foot) => foot.setVisible(false));
+      const deathDuration = monsterSpriteStateDurationMs("death", view.spriteSkin);
       const deathFade =
         monster.hp > 0
           ? 1
-          : 1 - Phaser.Math.Clamp((this.time.now - (view.diedAt || this.time.now)) / monsterSpriteStateDurationMs("death", view.spriteSkin), 0, 1);
-      const flightLift = view.spriteSkin.flying ? size.height * 0.12 : 0;
+          : 1 - Phaser.Math.Clamp((this.time.now - (view.diedAt || this.time.now)) / deathDuration, 0, 1);
+      const flying = view.originalArt?.flying ?? view.spriteSkin?.flying ?? false;
+      const flightLift = flying ? size.height * 0.1 : 0;
       // Pack 12 uses a bottom pivot: the boots already land exactly at position.y.
-      const groundShadowDrop = view.spriteSkin.packId === 12 ? 2 : size.height * 0.35;
+      const groundShadowDrop = view.originalArt ? 3 : view.spriteSkin?.packId === 12 ? 2 : size.height * 0.35;
       shadow
         .setVisible(monster.hp > 0 || deathFade > 0.02)
         .setPosition(position.x, position.y + groundShadowDrop + flightLift)
-        .setSize(Math.max(18, size.width * (view.spriteSkin.flying ? 0.56 : 0.64)), Math.max(5, size.height * 0.13))
+        .setSize(Math.max(18, size.width * (flying ? 0.52 : 0.6)), Math.max(5, size.height * 0.11))
         .setRotation(0)
-        .setAlpha(alpha * deathFade * (view.spriteSkin.flying ? 0.24 : 0.34));
+        .setAlpha(alpha * deathFade * (flying ? 0.22 : 0.32));
       return;
     }
     const visible = monster.hp > 0;
@@ -13110,7 +13242,7 @@ export class WorldScene extends Phaser.Scene {
 
   private monsterVisualVariant(monster: MonsterState): { tint: number; labelColor: string; scale: number } {
     const regionTint = this.monsterRegionTint(monster);
-    const atlasBacked = Boolean(this.loadedMonsterSpriteSkin(monster));
+    const atlasBacked = Boolean(darkVellMonsterArtFor(monster.archetype) || this.loadedMonsterSpriteSkin(monster));
     const tint = atlasBacked && regionTint !== 0xffffff ? this.mixNumberColor(0xffffff, regionTint, 0.12) : atlasBacked ? 0xffffff : regionTint;
     const scaleSeed = this.stableHash(`${monster.id}:visual`) % 7;
     return {

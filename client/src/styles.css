@@ -3789,6 +3789,52 @@ html.mmoAttackCursorHot .gameHost canvas {
   filter: drop-shadow(0 1px 2px #000000aa);
 }
 
+.skillAtlasIcon {
+  background-image: url("/assets/darkvell-original/v1/skill-icons.png") !important;
+  background-position: var(--skill-art-x) var(--skill-art-y) !important;
+  background-repeat: no-repeat !important;
+  background-size: 500% 500% !important;
+  display: inline-block;
+}
+
+.basicAttackAtlasIcon {
+  background-image: url("/assets/darkvell-original/v1/basic-attacks.png") !important;
+  background-position: var(--basic-attack-art-x) 50% !important;
+  background-repeat: no-repeat !important;
+  background-size: 500% auto !important;
+  display: inline-block;
+}
+
+.skillSlot.hasSkillArt {
+  background: #030606;
+  border-color: #4b5563;
+  overflow: hidden;
+  padding: 2px;
+}
+
+.skillSlot.hasSkillArt > span,
+.skillSlot.hasSkillArt > small {
+  display: none;
+}
+
+.skillSlot .hotbarSkillArt {
+  border: 0;
+  border-radius: 6px;
+  box-shadow: none;
+  height: auto;
+  inset: 2px;
+  position: absolute;
+  width: auto;
+  z-index: 2;
+}
+
+.skillIcon.profileSkillArt {
+  border: 0;
+  border-radius: 8px;
+  box-shadow: 0 4px 16px #00000070;
+  flex: 0 0 42px;
+}
+
 .skillSlot small {
   color: #94a3b8;
   font-size: 9px;
@@ -3830,6 +3876,11 @@ html.mmoAttackCursorHot .gameHost canvas {
 .lockedSkill {
   filter: grayscale(0.85);
   opacity: 0.5;
+}
+
+.lockedSkill.hasSkillArt {
+  filter: grayscale(0.6) brightness(0.84);
+  opacity: 0.72;
 }
 
 .chatForm input,

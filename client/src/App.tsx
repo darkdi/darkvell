@@ -475,6 +475,61 @@ const skillVisuals: Record<string, SkillVisual> = {
   "guard-break": { Icon: ShieldAlert, className: "skillElementBreak", shortLabel: "Gb" },
   "iron-roar": { Icon: Crown, className: "skillElementRoar", shortLabel: "Ir" }
 };
+const skillAtlasCells: Record<string, readonly [column: number, row: number]> = {
+  cleave: [0, 0],
+  whirlwind: [1, 0],
+  "rush-break": [2, 0],
+  "earth-splitter": [3, 0],
+  "shadow-step": [0, 1],
+  "twin-cut": [1, 1],
+  "venom-fang": [2, 1],
+  "smoke-dance": [3, 1],
+  "frost-bolt": [0, 2],
+  "fire-nova": [1, 2],
+  "arc-lightning": [2, 2],
+  meteor: [3, 2],
+  "healing-light": [4, 2],
+  "piercing-shot": [0, 3],
+  volley: [1, 3],
+  "pinning-shot": [2, 3],
+  "rain-of-arrows": [3, 3],
+  "shield-bash": [0, 4],
+  "ground-slam": [1, 4],
+  "guard-break": [2, 4],
+  "iron-roar": [3, 4]
+};
+
+function SkillArt({ skillId, className = "" }: { skillId: string; className?: string }) {
+  const cell = skillAtlasCells[skillId];
+  if (!cell) {
+    return null;
+  }
+  return (
+    <i
+      aria-hidden="true"
+      className={`skillAtlasIcon ${className}`.trim()}
+      style={{ "--skill-art-x": `${cell[0] * 25}%`, "--skill-art-y": `${cell[1] * 25}%` } as CSSProperties}
+    />
+  );
+}
+
+const basicAttackAtlasColumns: Record<CharacterClass, number> = {
+  warrior: 0,
+  tank: 1,
+  assassin: 2,
+  archer: 3,
+  mage: 4
+};
+
+function BasicAttackArt({ classId, className = "" }: { classId: CharacterClass; className?: string }) {
+  return (
+    <i
+      aria-hidden="true"
+      className={`basicAttackAtlasIcon ${className}`.trim()}
+      style={{ "--basic-attack-art-x": `${basicAttackAtlasColumns[classId] * 25}%` } as CSSProperties}
+    />
+  );
+}
 const MAP_ZOOM_MIN = 1;
 const MAP_ZOOM_MAX = 120;
 const DEFAULT_MAP_ZOOM = 5;
@@ -5820,7 +5875,9 @@ export function App() {
                     const visual = entry?.type === "attack" ? basicAttackVisual : entry?.type === "sprint" ? sprintVisual : skill ? skillVisual(skill.id) : undefined;
                     const SkillIcon = visual?.Icon;
                     const toneClass = visual ? visual.className : item ? "itemSlot" : "emptySlot";
-                    const slotClass = `${locked ? `skillSlot ${toneClass} lockedSkill` : `skillSlot ${toneClass}`}${cooldownRatio > 0 ? " coolingDown" : ""}`;
+                    const hasSkillArt = Boolean(skill && skillAtlasCells[skill.id]);
+                    const hasPaintedArt = entry?.type === "attack" || hasSkillArt;
+                    const slotClass = `${locked ? `skillSlot ${toneClass} lockedSkill` : `skillSlot ${toneClass}`}${cooldownRatio > 0 ? " coolingDown" : ""}${hasPaintedArt ? " hasSkillArt" : ""}`;
                     return (
                       <button
                         type="button"
@@ -5835,7 +5892,11 @@ export function App() {
                         title={tr(label)}
                       >
                         <span>{index + 1}</span>
-                        {SkillIcon && visual ? (
+                        {entry?.type === "attack" ? (
+                          <BasicAttackArt classId={classId} className="hotbarSkillArt" />
+                        ) : skill && hasSkillArt ? (
+                          <SkillArt skillId={skill.id} className="hotbarSkillArt" />
+                        ) : SkillIcon && visual ? (
                           <i className={`skillGlyph ${visual.className}`} aria-hidden="true">
                             <SkillIcon size={24} />
                           </i>
@@ -6210,9 +6271,7 @@ export function App() {
                       </div>
                     </div>
                     <div className={`skillNode ${basicAttackVisual.className}`}>
-                      <span className={`skillIcon ${basicAttackVisual.className}`}>
-                        <Swords size={20} />
-                      </span>
+                      <BasicAttackArt classId={classId} className={`skillIcon ${basicAttackVisual.className} profileSkillArt`} />
                       <div>
                         <strong>{tr("Basic attack")}</strong>
                         <span>
@@ -6235,12 +6294,9 @@ export function App() {
                     </div>
                     {activeClassDef.skills.map((skill) => {
                       const visual = skillVisual(skill.id);
-                      const SkillIcon = visual.Icon;
                       return (
                         <div className={currentLevel < (skill.requiredLevel ?? 1) ? `skillNode ${visual.className} lockedSkillNode` : `skillNode ${visual.className}`} key={skill.id}>
-                          <span className={`skillIcon ${visual.className}`}>
-                            <SkillIcon size={20} />
-                          </span>
+                          <SkillArt skillId={skill.id} className={`skillIcon ${visual.className} profileSkillArt`} />
                           <div>
                             <strong>
                               {skill.key} - {tr(skill.label)}
