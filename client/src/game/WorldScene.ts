@@ -1,5 +1,6 @@
 import Phaser from "phaser";
 import {
+  BESTIARY_CAVERN_DUNGEON_ID,
   CITY_MERCHANTS,
   CLASS_DEFINITIONS,
   CITY_DEFINITIONS,
@@ -41,12 +42,12 @@ import {
   monsterSpriteFrameName,
   monsterSpriteSkinFor,
   monsterSpriteStateDurationMs,
+  preloadMonsterSpriteAssets,
   requestMonsterSpriteAsset,
   type MonsterSpriteSkin,
   type MonsterSpriteState
 } from "./monsterSpriteAssets";
 import {
-  DARKVELL_CITY_ATLAS_KEY,
   darkVellMonsterArtFor,
   darkVellMonsterTexture,
   preloadDarkVellOriginalAssets,
@@ -62,6 +63,10 @@ import {
   worldFoliagePaletteFor,
   type WorldFoliageForm
 } from "./worldFoliageAssets";
+
+const DARKVELL_SHOWCASE_DUNGEON = WORLD_DUNGEON_INTERIORS.find(
+  (dungeon) => dungeon.id === BESTIARY_CAVERN_DUNGEON_ID
+);
 
 interface PlayerView {
   body: Phaser.GameObjects.Image;
@@ -843,6 +848,7 @@ export class WorldScene extends Phaser.Scene {
     Object.values(CUSTOM_PLAYER_HEADS).forEach((head) => {
       this.load.image(head.texture, head.url);
     });
+    preloadMonsterSpriteAssets(this);
     preloadDarkVellOriginalAssets(this);
     preloadWorldFoliageAssets(this);
   }
@@ -6248,6 +6254,7 @@ export class WorldScene extends Phaser.Scene {
         });
       }
 
+      const houseTextures = ["city-house", "city-house-blue", "city-house-green", "city-house-stone"] as const;
       const placeStructure = (texture: string, dx: number, dy: number, scale: number, rotation = 0, depth = 6) => {
         this.add
           .image(city.position.x + dx, city.position.y + dy, texture)
@@ -6255,80 +6262,63 @@ export class WorldScene extends Phaser.Scene {
           .setScale(scale)
           .setDepth(depth + dy * 0.0002);
       };
-      const placePaintedStructure = (frame: number, dx: number, dy: number, scale: number, rotation = 0, depth = 6) => {
-        this.add
-          .image(city.position.x + dx, city.position.y + dy, DARKVELL_CITY_ATLAS_KEY, frame)
-          .setOrigin(0.5, 0.82)
-          .setRotation(rotation)
-          .setScale(scale)
-          .setDepth(depth + dy * 0.0002);
-      };
-      const houseFrames = [0, 1, 4, 5] as const;
-      const residentialSlots = [
-        { x: -0.74, y: -0.42, rotation: -0.018 },
-        { x: 0.74, y: -0.42, rotation: 0.018 },
-        { x: -0.74, y: 0.42, rotation: 0.018 },
-        { x: 0.74, y: 0.42, rotation: -0.018 },
-        { x: -0.34, y: -0.49, rotation: -0.012 },
-        { x: 0.34, y: -0.49, rotation: 0.012 },
-        { x: -0.34, y: 0.49, rotation: 0.012 },
-        { x: 0.34, y: 0.49, rotation: -0.012 }
-      ] as const;
       const houseCount =
         isGrandCapital
-          ? 8
+          ? 16
           : isHub
-            ? 6
+            ? 14
             : city.kind === "harbor" || city.kind === "fortress"
-              ? 6
-              : city.kind === "outpost"
-                ? 2
-                : 4;
+              ? 9
+              : city.kind === "village"
+                ? 8
+                : city.kind === "sanctum"
+                  ? 7
+                  : 5;
       for (let index = 0; index < houseCount; index += 1) {
-        const slot = residentialSlots[index];
-        const dx = townRadius * slot.x;
-        const dy = townRadius * slot.y;
-        const frame = houseFrames[(index + city.recommendedLevel) % houseFrames.length];
+        const angle = (index / houseCount) * Math.PI * 2 + (index % 2) * 0.18;
+        const radiusX = townRadius * (isMajorCapital ? 0.68 : 0.7) * (0.78 + (index % 3) * 0.08);
+        const radiusY = townRadius * (isMajorCapital ? 0.42 : 0.46) * (0.82 + (index % 4) * 0.05);
+        const dx = Math.cos(angle) * radiusX;
+        const dy = Math.sin(angle) * radiusY;
+        const texture = houseTextures[(index + city.recommendedLevel) % houseTextures.length];
         const houseScale =
           isGrandCapital
-            ? 0.51
+            ? 0.82
             : isHub
-              ? 0.48
+              ? 0.76
               : city.kind === "outpost"
-                ? 0.36
+                ? 0.52
                 : city.kind === "sanctum"
-                  ? 0.39
-                  : city.kind === "fortress"
-                    ? 0.43
-                    : 0.41;
-        placePaintedStructure(frame, dx, dy, houseScale, slot.rotation, 5.95);
+                  ? 0.58
+                  : 0.64;
+        placeStructure(texture, dx, dy, houseScale, angle * 0.06, 5.95);
       }
 
       if (isMajorCapital) {
-        placePaintedStructure(2, 0, isGrandCapital ? -168 : -124, isGrandCapital ? 0.6 : 0.52, 0, 6.25);
-        placePaintedStructure(3, -townRadius * 0.38, townRadius * 0.18, isGrandCapital ? 0.5 : 0.45, -0.025, 6.2);
-        placePaintedStructure(6, townRadius * 0.4, townRadius * 0.16, isGrandCapital ? 0.47 : 0.41, 0.025, 6.2);
+        placeStructure("city-keep", 0, isGrandCapital ? -168 : -124, isGrandCapital ? 1.42 : 1.18, 0, 6.25);
+        placeStructure("city-market", -townRadius * 0.38, townRadius * 0.18, isGrandCapital ? 0.92 : 0.82, -0.04, 6.2);
+        placeStructure("city-shrine", townRadius * 0.4, townRadius * 0.16, isGrandCapital ? 0.84 : 0.72, 0.04, 6.2);
         placeStructure("city-fountain", 0, townRadius * 0.18, isGrandCapital ? 1.08 : 0.9, 0, 6.1);
-        placePaintedStructure(7, -townRadius * 0.52, -townRadius * 0.14, isGrandCapital ? 0.46 : 0.4, -0.035, 6.15);
-        placePaintedStructure(7, townRadius * 0.52, -townRadius * 0.14, isGrandCapital ? 0.46 : 0.4, 0.035, 6.15);
+        placeStructure("city-tower", -townRadius * 0.52, -townRadius * 0.14, isGrandCapital ? 0.82 : 0.68, -0.05, 6.15);
+        placeStructure("city-tower", townRadius * 0.52, -townRadius * 0.14, isGrandCapital ? 0.82 : 0.68, 0.05, 6.15);
         if (isGrandCapital) {
           placeStructure("city-gate", 0, townRadius * 0.56, 0.86, Math.PI, 6.24);
-          placePaintedStructure(2, -townRadius * 0.72, townRadius * 0.02, 0.44, -0.03, 6.18);
-          placePaintedStructure(2, townRadius * 0.72, townRadius * 0.02, 0.44, 0.03, 6.18);
+          placeStructure("city-keep", -townRadius * 0.72, townRadius * 0.02, 0.82, -0.04, 6.18);
+          placeStructure("city-keep", townRadius * 0.72, townRadius * 0.02, 0.82, 0.04, 6.18);
         }
       } else {
         if (city.kind === "sanctum") {
-          placePaintedStructure(6, 0, -townRadius * 0.2, 0.44, 0, 6.22);
+          placeStructure("city-shrine", 0, -townRadius * 0.2, 0.82, 0, 6.22);
           placeStructure("decor-obelisk", -townRadius * 0.36, townRadius * 0.1, 0.58, -0.05, 6.15);
           placeStructure("decor-obelisk", townRadius * 0.36, townRadius * 0.1, 0.58, 0.05, 6.15);
           placeStructure("city-fountain", 0, townRadius * 0.28, 0.5, 0, 6.1);
         } else {
-          placePaintedStructure(2, 0, -townRadius * 0.22, city.kind === "fortress" ? 0.5 : city.kind === "outpost" ? 0.38 : 0.44, 0, 6.2);
-          placePaintedStructure(3, -townRadius * 0.38, townRadius * 0.18, city.kind === "outpost" ? 0.3 : 0.35, -0.025, 6.12);
+          placeStructure("city-keep", 0, -townRadius * 0.22, city.kind === "fortress" ? 0.92 : city.kind === "outpost" ? 0.68 : 0.8, 0, 6.2);
+          placeStructure("city-market", -townRadius * 0.38, townRadius * 0.18, city.kind === "outpost" ? 0.48 : 0.58, -0.04, 6.12);
           placeStructure("city-fountain", townRadius * 0.34, townRadius * 0.18, city.kind === "outpost" ? 0.42 : 0.5, 0.03, 6.08);
         }
         if (city.kind !== "village") {
-          placePaintedStructure(7, 0, townRadius * 0.46, city.kind === "fortress" ? 0.4 : 0.35, 0, 6.14);
+          placeStructure("city-tower", 0, townRadius * 0.46, city.kind === "fortress" ? 0.66 : 0.58, 0, 6.14);
         }
       }
 
@@ -7681,44 +7671,37 @@ export class WorldScene extends Phaser.Scene {
                       : 0.46)
         )
       );
-      const propSlots = [
-        { x: -0.7, y: -0.4 },
-        { x: 0.7, y: -0.4 },
-        { x: -0.7, y: 0.4 },
-        { x: 0.7, y: 0.4 },
-        { x: -0.28, y: -0.48 },
-        { x: 0.28, y: -0.48 }
-      ] as const;
-      const propCount = isHub || isGrandCapital ? 6 : city.kind === "outpost" ? 2 : 4;
-      const houseFrames = [0, 1, 4, 5] as const;
+      const radiusX = visualRadius * (isHub || isGrandCapital ? 0.72 : 0.68);
+      const radiusY = visualRadius * (isHub || isGrandCapital ? 0.46 : 0.43);
+      const propCount = isHub || isGrandCapital ? 9 : 5;
+      const houseTextures = ["city-house", "city-house-blue", "city-house-green", "city-house-stone"] as const;
       for (let index = 0; index < propCount; index += 1) {
-        const slot = propSlots[index];
-        const angle = slot.x * 0.04;
-        const x = city.position.x + slot.x * visualRadius;
-        const y = city.position.y + slot.y * visualRadius;
-        const fallbackTexture =
+        const angle = (index / propCount) * Math.PI * 2 + (city.position.x % 37) * 0.004;
+        const x = city.position.x + Math.cos(angle) * radiusX;
+        const y = city.position.y + Math.sin(angle) * radiusY;
+        const texture =
           city.kind === "harbor" && index === propCount - 1
             ? "city-dock"
-            : city.kind === "outpost" && index === propCount - 1
+            : city.kind === "sanctum" && index === 0
+              ? "decor-safe-shrine"
+              : city.kind === "outpost" && index === propCount - 1
                 ? "city-tent"
-                : undefined;
-        const frame = city.kind === "sanctum" && index === 0 ? 6 : houseFrames[(index + city.recommendedLevel) % houseFrames.length];
-        const scale = fallbackTexture
-          ? fallbackTexture === "city-dock"
+                : houseTextures[(index + city.recommendedLevel) % houseTextures.length];
+        const scale =
+          texture === "city-dock"
             ? 0.5
-            : fallbackTexture === "city-tent"
+            : texture === "decor-safe-shrine"
+              ? 0.52
+              : texture === "city-tent"
                 ? 0.48
-                : 0.48
-          : isHub || isGrandCapital
-            ? 0.35
-            : 0.31;
-        const prop = fallbackTexture
-          ? this.add.image(x, y, fallbackTexture)
-          : this.add.image(x, y, DARKVELL_CITY_ATLAS_KEY, frame).setOrigin(0.5, 0.82);
-        prop
-          .setRotation(fallbackTexture === "city-dock" ? angle + Math.PI / 2 : angle * 0.055)
+                : isHub || isGrandCapital
+                  ? 0.54
+                  : 0.48;
+        this.add
+          .image(x, y, texture)
+          .setRotation(texture === "city-dock" ? angle + Math.PI / 2 : angle * 0.08)
           .setScale(scale)
-          .setAlpha(fallbackTexture ? 0.82 : 0.9)
+          .setAlpha(0.82)
           .setDepth(6.36 + y * 0.00014);
       }
     };
@@ -12584,12 +12567,25 @@ export class WorldScene extends Phaser.Scene {
     let view = this.monsters.get(monster.id);
     const size = this.monsterDrawSize(monster);
     const serverTime = this.snapshot?.serverTime ?? Date.now();
-    const originalArt = darkVellMonsterArtFor(monster.archetype);
-    const loadedSpriteSkin = originalArt ? undefined : this.loadedMonsterSpriteSkin(monster);
+    const originalArt = this.darkVellDungeonArtFor(monster);
+    const loadedSpriteSkin = this.loadedMonsterSpriteSkin(monster);
     if (!originalArt && !loadedSpriteSkin && monster.spritePackId && this.isPositionNearCamera(monster.position, 720)) {
       requestMonsterSpriteAsset(this, monster.spritePackId);
     }
-    if (view && !view.originalArt && originalArt) {
+    if (view && view.originalArt && !originalArt) {
+      view.originalArt = undefined;
+      view.spriteSkin = loadedSpriteSkin;
+      view.animationState = loadedSpriteSkin ? "idle" : undefined;
+      view.animationStartedAt = this.time.now;
+      view.lastAnimationFrame = "";
+      if (loadedSpriteSkin) {
+        view.body
+          .setTexture(loadedSpriteSkin.atlasKey, monsterSpriteFrameName(loadedSpriteSkin, "idle", 0))
+          .setOrigin(0.5);
+      } else {
+        view.body.setTexture(this.monsterTexture(monster)).setOrigin(0.5);
+      }
+    } else if (view && !view.originalArt && originalArt) {
       view.originalArt = originalArt;
       view.spriteSkin = undefined;
       view.animationState = "idle";
@@ -13113,7 +13109,19 @@ export class WorldScene extends Phaser.Scene {
     view.hp.setVisible(visible);
   }
 
-  private createMonsterFeet(monster: MonsterState, atlasBacked = Boolean(darkVellMonsterArtFor(monster.archetype) || this.loadedMonsterSpriteSkin(monster))): Phaser.GameObjects.Ellipse[] {
+  private darkVellDungeonArtFor(monster: MonsterState): DarkVellMonsterArt | undefined {
+    const dungeon = DARKVELL_SHOWCASE_DUNGEON;
+    if (
+      !dungeon ||
+      Math.abs(monster.position.x - dungeon.position.x) > dungeon.width / 2 ||
+      Math.abs(monster.position.y - dungeon.position.y) > dungeon.height / 2
+    ) {
+      return undefined;
+    }
+    return darkVellMonsterArtFor(monster.archetype);
+  }
+
+  private createMonsterFeet(monster: MonsterState, atlasBacked = Boolean(this.darkVellDungeonArtFor(monster) || this.loadedMonsterSpriteSkin(monster))): Phaser.GameObjects.Ellipse[] {
     if (atlasBacked) {
       return [this.add.ellipse(monster.position.x, monster.position.y, 24, 8, 0x020617, 0.3).setDepth(7.7).setSmoothness(16)];
     }
@@ -13242,7 +13250,7 @@ export class WorldScene extends Phaser.Scene {
 
   private monsterVisualVariant(monster: MonsterState): { tint: number; labelColor: string; scale: number } {
     const regionTint = this.monsterRegionTint(monster);
-    const atlasBacked = Boolean(darkVellMonsterArtFor(monster.archetype) || this.loadedMonsterSpriteSkin(monster));
+    const atlasBacked = Boolean(this.darkVellDungeonArtFor(monster) || this.loadedMonsterSpriteSkin(monster));
     const tint = atlasBacked && regionTint !== 0xffffff ? this.mixNumberColor(0xffffff, regionTint, 0.12) : atlasBacked ? 0xffffff : regionTint;
     const scaleSeed = this.stableHash(`${monster.id}:visual`) % 7;
     return {
