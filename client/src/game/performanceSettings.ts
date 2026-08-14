@@ -16,10 +16,10 @@ export type MobileGraphicsSettings = {
   mobileFullWorldMap: boolean;
 };
 
-// Bumped v8 -> v9 on 2026-08-07 so existing phones pick up the new default of a
-// full world map. Saved settings store every field explicitly, so without a new
-// key only brand new players would have seen the change.
-export const mobileGraphicsStorageKey = "mmo.mobileGraphics.v9";
+// v10 safely rolls the expensive full-world option back to opt-in. Existing v9
+// settings are migrated below so all unrelated user choices stay intact.
+export const mobileGraphicsStorageKey = "mmo.mobileGraphics.v10";
+const previousMobileGraphicsStorageKey = "mmo.mobileGraphics.v9";
 
 const highQualityWorldVisuals = {
   worldDecorations: true,
@@ -45,14 +45,6 @@ const leanWorldVisuals = {
 const stableFullTextureWorldVisuals = {
   ...leanWorldVisuals,
   desktopWorldTextures: true
-};
-
-// The default mobile look as of 2026-08-07: desktop-style world map on phones.
-// "cool" and "minimal" deliberately stay on the lean map -- they exist as the
-// escape hatch for phones that heat up or drop frames.
-const fullWorldMapVisuals = {
-  ...stableFullTextureWorldVisuals,
-  mobileFullWorldMap: true
 };
 
 export const mobileGraphicsPresets: Array<{ id: ClientGraphicsPreset; label: string; hint: string; settings: MobileGraphicsSettings }> = [
@@ -95,8 +87,8 @@ export const mobileGraphicsPresets: Array<{ id: ClientGraphicsPreset; label: str
   {
     id: "balanced",
     label: "Balanced 60",
-    hint: "60 FPS default: full mobile world, readable effects and crowd savings.",
-    settings: { preset: "balanced", fpsLimit: 60, ...fullWorldMapVisuals, combatEffects: true, floatingText: true, playerLabels: true, showFps: false }
+    hint: "60 FPS default: optimized mobile world, readable effects and crowd savings.",
+    settings: { preset: "balanced", fpsLimit: 60, ...stableFullTextureWorldVisuals, combatEffects: true, floatingText: true, playerLabels: true, showFps: false }
   },
   {
     id: "cool",
@@ -133,6 +125,12 @@ export function isRuStoreLaunch(): boolean {
 }
 
 export function isMobileGameRuntime(width = window.innerWidth, height = window.innerHeight): boolean {
+  const localMobilePreview =
+    (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1") &&
+    new URLSearchParams(window.location.search).get("mobilePreview") === "1";
+  if (localMobilePreview) {
+    return true;
+  }
   const userAgent = navigator.userAgent;
   const mobileUserAgent = /Android|iPhone|iPad|iPod|Mobile|DarkVellRuStore/i.test(userAgent);
   const coarsePointer = window.matchMedia?.("(pointer: coarse)").matches ?? false;
@@ -145,7 +143,7 @@ export function isMobileGameRuntime(width = window.innerWidth, height = window.i
 function ruStoreStartupSettings(): MobileGraphicsSettings {
   return {
     ...presetSettings("balanced"),
-    ...fullWorldMapVisuals,
+    ...stableFullTextureWorldVisuals,
     fpsLimit: 60,
     combatEffects: true,
     floatingText: true,
@@ -181,27 +179,27 @@ function defaultMobileGraphicsSettingsForDevice(): MobileGraphicsSettings {
   if (isRuStoreLaunch()) {
     return ruStoreStartupSettings();
   }
-
-  const nav = navigator as Navigator & { deviceMemory?: number };
-  const memory = nav.deviceMemory ?? 0;
-  const cores = navigator.hardwareConcurrency ?? 0;
-  const dpr = window.devicePixelRatio || 1;
-  const highDensity = dpr >= 2;
-  const veryHighDensity = dpr >= 3;
-  const shortSide = Math.min(window.innerWidth, window.innerHeight);
-  const longSide = Math.max(window.innerWidth, window.innerHeight);
-  const userAgent = navigator.userAgent;
-  const isiPhone = /iPhone/i.test(userAgent);
-  const isAndroid = /Android/i.test(userAgent);
-  const likelyProMotionIphone = isiPhone && veryHighDensity && shortSide >= 390 && longSide >= 844;
-  const likelyHighRefreshAndroid = isAndroid && highDensity && longSide >= 780 && cores >= 8 && (memory === 0 || memory >= 8);
-  return presetSettings(likelyProMotionIphone || likelyHighRefreshAndroid ? "balanced" : "balanced");
+  return presetSettings("balanced");
 }
 
 export function loadMobileGraphicsSettings(): MobileGraphicsSettings {
   try {
     const parsed = JSON.parse(window.localStorage.getItem(mobileGraphicsStorageKey) ?? "null") as Partial<MobileGraphicsSettings> | null | undefined;
-    return parsed ? normalizeMobileGraphicsSettings(parsed) : defaultMobileGraphicsSettingsForDevice();
+    if (parsed) {
+      return normalizeMobileGraphicsSettings(parsed);
+    }
+
+    const previous = JSON.parse(window.localStorage.getItem(previousMobileGraphicsStorageKey) ?? "null") as
+      | Partial<MobileGraphicsSettings>
+      | null
+      | undefined;
+    if (previous) {
+      const migrated = normalizeMobileGraphicsSettings({ ...previous, mobileFullWorldMap: false });
+      saveMobileGraphicsSettings(migrated);
+      return migrated;
+    }
+
+    return defaultMobileGraphicsSettingsForDevice();
   } catch {
     return defaultMobileGraphicsSettingsForDevice();
   }

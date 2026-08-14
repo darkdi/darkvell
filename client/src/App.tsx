@@ -56,6 +56,7 @@ import {
 } from "lucide-react";
 import {
   CHARACTER_FACE_VARIANT_COUNT,
+  CHARACTER_FACE_VARIANTS_PER_GENDER,
   CITY_DEFINITIONS,
   CLASS_DEFINITIONS,
   MAX_ARMOR_ENCHANT_LEVEL,
@@ -80,12 +81,15 @@ import {
   WORLD_WATERFALLS,
   WORLD_HAZARDS,
   enchantScrollIdsForGrade,
+  characterFaceStyleVariant,
+  characterGenderFromFace,
   itemGradeLabel,
   itemGradeText,
   xpForNextLevel,
   type AdminActionType,
   type AdminState,
   type CharacterClass,
+  type CharacterGender,
   type CharacterRace,
   type ChatChannel,
   type ChatMessage,
@@ -134,9 +138,32 @@ type AccountSession = {
     customHeadUrl?: string;
   };
 };
+type PremiumPlanId = "week" | "month";
+type PremiumStatus = {
+  enabled: boolean;
+  mode: "disabled" | "demo" | "production";
+  status: "none" | "pending" | "trial" | "active" | "past_due" | "canceled";
+  planId?: PremiumPlanId;
+  premiumUntil?: string;
+  nextChargeAt?: string;
+  cancelAtPeriodEnd: boolean;
+  active: boolean;
+  canStartTrial: boolean;
+  lastError?: string;
+};
+type CoinPaymentStatus = {
+  enabled: boolean;
+  mode: "disabled" | "demo" | "production";
+  priceRub: 1;
+  coinQuantity: 1;
+  status: "none" | "pending" | "paid" | "failed";
+  orderId?: string;
+  updatedAt?: string;
+  lastError?: string;
+};
 type HotbarEntry = { type: "attack" } | { type: "sprint" } | { type: "skill"; skillId: string } | { type: "item"; itemId: string };
 type SkillVisual = { Icon: typeof Zap; className: string; shortLabel: string };
-type FaceParts = { hair: number; eyes: number; mark: number };
+type FaceParts = { gender: CharacterGender; hair: number; eyes: number; mark: number };
 type LocalFacingEventDetail = { x?: number; y?: number; degrees?: number };
 type ChallengePeriod = "hourly" | "daily";
 type ChallengeMetric = "xp" | "gold" | "coin" | "arenaWins" | "level" | "gear";
@@ -234,11 +261,16 @@ const questCompleteSparkIndexes = Array.from({ length: 16 }, (_, index) => index
 const hairOptions = ["Crop", "Wave", "Topknot", "Long", "Hawk", "Braids"];
 const eyeOptions = ["Dark", "Green", "Gold", "Ice"];
 const markOptions = ["Clean", "Scar", "Tattoo", "Warpaint"];
+const femaleMarkOptions = ["Clean", "Scar", "Rune", "Makeup"];
 const raceOptions: Array<{ id: CharacterRace; label: string }> = [
   { id: "human", label: "Human" },
   { id: "elf", label: "Elf" },
   { id: "darkelf", label: "Dark Elf" },
   { id: "orc", label: "Orc" }
+];
+const genderOptions: Array<{ id: CharacterGender; label: string }> = [
+  { id: "male", label: "Male" },
+  { id: "female", label: "Female" }
 ];
 const playableClassIds: CharacterClass[] = ["mage", "warrior", "assassin", "archer"];
 const playableClassDefinitions = playableClassIds.map((id) => CLASS_DEFINITIONS[id]);
@@ -440,7 +472,7 @@ function enchantScrollIdsForItem(item?: InventoryItem): string[] {
 const profileTabs: Array<{ id: ProfileTab; label: string; icon: typeof Backpack }> = [
   { id: "equipment", label: "Gear", icon: Backpack },
   { id: "stats", label: "Stats", icon: Shield },
-  { id: "wallet", label: "Wallet", icon: WalletCards },
+  { id: "wallet", label: "Premium & Coin", icon: Crown },
   { id: "skills", label: "Skills", icon: BookOpen },
   { id: "quests", label: "Quests", icon: Target },
   { id: "clan", label: "Clan", icon: Shield },
@@ -504,11 +536,23 @@ function SkillArt({ skillId, className = "" }: { skillId: string; className?: st
   if (!cell) {
     return null;
   }
+  // The painted circles in the source atlas lean a few pixels toward the atlas
+  // centre. Compensate by column so every icon is optically centred in its own slot.
+  const horizontalNudge = (cell[0] - 2) * 1.5;
   return (
     <i
       aria-hidden="true"
       className={`skillAtlasIcon ${className}`.trim()}
-      style={{ "--skill-art-x": `${cell[0] * 25}%`, "--skill-art-y": `${cell[1] * 25}%` } as CSSProperties}
+      style={
+        {
+          "--skill-art-x": `${cell[0] * 25}%`,
+          "--skill-art-y": `${cell[1] * 25}%`,
+          "--skill-art-nudge-x": `${horizontalNudge}px`,
+          // Keep the painted circle clear of the slot's bottom edge. Moving the
+          // atlas upward also prevents the previous row leaking in at the top.
+          "--skill-art-nudge-y": "-3px"
+        } as CSSProperties
+      }
     />
   );
 }
@@ -1241,11 +1285,39 @@ function loadLauncherProfile(): { name: string; classId: CharacterClass; legacyC
   }
 }
 
+function sessionTokenPayload(token: string): { authProvider?: string; exp?: string } | undefined {
+  try {
+    const encoded = token.split(".")[0];
+    if (!encoded) return undefined;
+    const base64 = encoded.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, "=");
+    return JSON.parse(atob(padded)) as { authProvider?: string; exp?: string };
+  } catch {
+    return undefined;
+  }
+}
+
+function accountSessionNeedsRefresh(session: AccountSession): boolean {
+  const expiresAt = Date.parse(sessionTokenPayload(session.token)?.exp ?? "");
+  return !Number.isFinite(expiresAt) || expiresAt <= Date.now() + 24 * 60 * 60 * 1000;
+}
+
+function isAccountSessionMessage(message: string): boolean {
+  return ["Account session is required.", "Account session is not valid.", "Session token expired."].includes(message);
+}
+
 function loadAccountSession(): AccountSession | undefined {
   try {
     const parsed = JSON.parse(window.localStorage.getItem(accountStorageKey) ?? "null") as AccountSession | null;
     if (parsed?.token && parsed.character?.id) {
-      return parsed;
+      let authProvider = parsed.authProvider;
+      if (!authProvider) {
+        const payload = sessionTokenPayload(parsed.token);
+        authProvider = payload?.authProvider === "account" ? "account" : payload?.authProvider === "guest" ? "guest" : undefined;
+      }
+      const migrated = { ...parsed, authProvider: authProvider ?? (parsed.login ? "account" : "guest") };
+      saveAccountSession(migrated);
+      return migrated;
     }
   } catch {
     return undefined;
@@ -1823,8 +1895,10 @@ function normalizeHotbar(classId: CharacterClass, entries?: Array<HotbarEntry | 
 }
 
 function decodeFaceVariant(face?: number): FaceParts {
-  const variant = Math.max(1, Math.min(CHARACTER_FACE_VARIANT_COUNT, Math.trunc(face ?? 1))) - 1;
+  const normalized = Math.max(1, Math.min(CHARACTER_FACE_VARIANT_COUNT, Math.trunc(face ?? 1)));
+  const variant = characterFaceStyleVariant(normalized) - 1;
   return {
+    gender: characterGenderFromFace(normalized),
     hair: (variant % hairOptions.length) + 1,
     eyes: (Math.floor(variant / hairOptions.length) % eyeOptions.length) + 1,
     mark: (Math.floor(variant / (hairOptions.length * eyeOptions.length)) % markOptions.length) + 1
@@ -1835,7 +1909,8 @@ function encodeFaceVariant(parts: FaceParts): number {
   const hair = Math.max(1, Math.min(hairOptions.length, Math.trunc(parts.hair)));
   const eyes = Math.max(1, Math.min(eyeOptions.length, Math.trunc(parts.eyes)));
   const mark = Math.max(1, Math.min(markOptions.length, Math.trunc(parts.mark)));
-  return 1 + (hair - 1) + (eyes - 1) * hairOptions.length + (mark - 1) * hairOptions.length * eyeOptions.length;
+  const styleVariant = 1 + (hair - 1) + (eyes - 1) * hairOptions.length + (mark - 1) * hairOptions.length * eyeOptions.length;
+  return styleVariant + (parts.gender === "female" ? CHARACTER_FACE_VARIANTS_PER_GENDER : 0);
 }
 
 function itemKind(item?: InventoryItem, slot?: EquipmentSlot): EquipmentSlot | "item" {
@@ -2299,6 +2374,7 @@ export function App() {
   const [face, setFace] = useState(accountSession?.character.face ?? 1);
   const [customHeadUrl, setCustomHeadUrl] = useState(accountSession?.character.customHeadUrl);
   const faceParts = useMemo(() => decodeFaceVariant(face), [face]);
+  const activeMarkOptions = faceParts.gender === "female" ? femaleMarkOptions : markOptions;
   const [legacyCharacterId, setLegacyCharacterId] = useState(accountSession ? undefined : launcherProfile.legacyCharacterId);
   const [authError, setAuthError] = useState("");
   const [authNotice, setAuthNotice] = useState("");
@@ -2342,8 +2418,15 @@ export function App() {
   const [selectedBagIndex, setSelectedBagIndex] = useState<number>();
   const [selectedEquipmentSlot, setSelectedEquipmentSlot] = useState<EquipmentSlot>();
   const [gold, setGold] = useState(0);
-  const [walletState, setWalletState] = useState<WalletState>({ mode: "telegram-ton", connected: false, pendingToken: 0 });
-  const [claimStatus, setClaimStatus] = useState("25 gold = 1 TOKEN");
+  const [, setWalletState] = useState<WalletState>({ mode: "telegram-ton", connected: false, pendingToken: 0 });
+  const [, setClaimStatus] = useState("25 gold = 1 TOKEN");
+  const [premiumStatus, setPremiumStatus] = useState<PremiumStatus>();
+  const [premiumPlan, setPremiumPlan] = useState<PremiumPlanId>("month");
+  const [premiumBusy, setPremiumBusy] = useState(false);
+  const [premiumMessage, setPremiumMessage] = useState("");
+  const [coinPaymentStatus, setCoinPaymentStatus] = useState<CoinPaymentStatus>();
+  const [coinPaymentBusy, setCoinPaymentBusy] = useState(false);
+  const [coinPaymentMessage, setCoinPaymentMessage] = useState("");
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatDraft, setChatDraft] = useState("");
   const [chatChannel, setChatChannel] = useState<Exclude<ChatChannel, "system">>("local");
@@ -2388,6 +2471,8 @@ export function App() {
   const chatDockRef = useRef<HTMLDivElement>(null);
   const chatInputRef = useRef<HTMLInputElement>(null);
   const mobileLayoutRef = useRef(mobileLayout);
+  const accountSessionRef = useRef(accountSession);
+  const accountSessionRefreshRef = useRef<Promise<AccountSession | undefined>>();
   const walletAddress = disabledTonWalletAddress();
   const blockchainApiUrl = runtimeUrl(import.meta.env.VITE_BLOCKCHAIN_API_URL, "/blockchain");
   const authApiUrl = runtimeUrl(import.meta.env.VITE_AUTH_API_URL, "/auth");
@@ -2407,6 +2492,75 @@ export function App() {
   useEffect(() => {
     saveLanguage(language);
   }, [language]);
+
+  useEffect(() => {
+    accountSessionRef.current = accountSession;
+  }, [accountSession]);
+
+  const renewAccountSession = useCallback(async (force = false): Promise<AccountSession | undefined> => {
+    const current = accountSessionRef.current;
+    if (!current?.token || current.authProvider !== "account") return undefined;
+    if (!force && !accountSessionNeedsRefresh(current)) return current;
+    if (accountSessionRefreshRef.current) return accountSessionRefreshRef.current;
+
+    const refreshRequest = (async (): Promise<AccountSession | undefined> => {
+      const response = await fetch(`${authApiUrl}/account/session/refresh`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${current.token}` }
+      });
+      const payload = (await response.json()) as {
+        token?: string;
+        message?: string;
+        player?: { character?: AccountSession["character"] };
+      };
+      if (!response.ok || !payload.token || !payload.player?.character) {
+        throw new Error(payload.message || "Account session is required.");
+      }
+
+      if (accountSessionRef.current?.token !== current.token) return accountSessionRef.current;
+      const refreshed: AccountSession = {
+        ...current,
+        token: payload.token,
+        authProvider: "account",
+        character: {
+          ...payload.player.character,
+          classId: normalizePlayableClass(payload.player.character.classId)
+        }
+      };
+      accountSessionRef.current = refreshed;
+      setAccountSession(refreshed);
+      setSessionToken(refreshed.token);
+      setAccountCharacterId(refreshed.character.id);
+      saveAccountSession(refreshed);
+      return refreshed;
+    })();
+
+    accountSessionRefreshRef.current = refreshRequest;
+    try {
+      return await refreshRequest;
+    } finally {
+      if (accountSessionRefreshRef.current === refreshRequest) accountSessionRefreshRef.current = undefined;
+    }
+  }, [authApiUrl]);
+
+  const fetchWithAccountSession = useCallback(async (path: string, init?: RequestInit): Promise<Response> => {
+    let session = await renewAccountSession(false);
+    if (!session) throw new Error("Account session is required.");
+
+    const send = (token: string): Promise<Response> => {
+      const headers = new Headers(init?.headers);
+      headers.set("authorization", `Bearer ${token}`);
+      return fetch(`${authApiUrl}${path}`, { ...init, headers });
+    };
+
+    let response = await send(session.token);
+    if (response.status === 401) {
+      session = await renewAccountSession(true);
+      if (!session) throw new Error("Account session is required.");
+      response = await send(session.token);
+    }
+    return response;
+  }, [authApiUrl, renewAccountSession]);
 
   const characterId = useMemo(() => accountCharacterId ?? legacyCharacterId ?? characterIdFor(playerName, classId), [accountCharacterId, legacyCharacterId, playerName, classId]);
   const localPlayer = snapshot?.players.find((player) => player.id === playerId);
@@ -2940,6 +3094,83 @@ export function App() {
       setGold(localPlayer.gold);
     }
   }, [localPlayer?.gold]);
+
+  const refreshPremiumStatus = useCallback(async () => {
+    if (!accountSession?.token || accountSession.authProvider !== "account") {
+      setPremiumStatus(undefined);
+      return;
+    }
+    try {
+      const response = await fetchWithAccountSession("/premium/status");
+      const payload = (await response.json()) as PremiumStatus & { message?: string };
+      if (!response.ok) throw new Error(payload.message || "Could not load Premium status.");
+      setPremiumStatus(payload);
+      // A pending card-link attempt may still carry the previously selected
+      // plan. Do not let the 3-second status poll overwrite a new manual choice
+      // before the player presses the activation button.
+      if (payload.planId && payload.status !== "pending") setPremiumPlan(payload.planId);
+      setPremiumMessage((previous) => isAccountSessionMessage(previous) ? "" : previous);
+    } catch (error) {
+      setPremiumMessage(error instanceof Error ? error.message : "Could not load Premium status.");
+    }
+  }, [accountSession?.authProvider, accountSession?.token, fetchWithAccountSession]);
+
+  useEffect(() => {
+    if (!started || !accountSession?.token || accountSession.authProvider !== "account") return undefined;
+    void refreshPremiumStatus();
+    const query = new URLSearchParams(window.location.search);
+    if (query.get("premium") === "success") {
+      setPremiumMessage("Card linked. Premium activation is being confirmed.");
+      window.setTimeout(() => void refreshPremiumStatus(), 1800);
+    } else if (query.get("premium") === "fail") {
+      setPremiumMessage("Card linking was canceled.");
+    }
+    const timer = window.setInterval(() => void refreshPremiumStatus(), 60_000);
+    return () => window.clearInterval(timer);
+  }, [accountSession?.authProvider, accountSession?.token, refreshPremiumStatus, started]);
+
+  useEffect(() => {
+    if (premiumStatus?.status !== "pending") return;
+    const timer = window.setInterval(() => void refreshPremiumStatus(), 3_000);
+    return () => window.clearInterval(timer);
+  }, [premiumStatus?.status, refreshPremiumStatus]);
+
+  const refreshCoinPaymentStatus = useCallback(async () => {
+    if (!accountSession?.token || accountSession.authProvider !== "account") {
+      setCoinPaymentStatus(undefined);
+      return;
+    }
+    try {
+      const response = await fetchWithAccountSession("/coin-shop/status");
+      const payload = (await response.json()) as CoinPaymentStatus & { message?: string };
+      if (!response.ok) throw new Error(payload.message || "Could not load Coin payment status.");
+      setCoinPaymentStatus(payload);
+      if (payload.status === "paid") setCoinPaymentMessage("Payment confirmed. 1 Coin has been added to your hero.");
+      if (payload.status === "failed") setCoinPaymentMessage(payload.lastError || "Payment was declined by the bank.");
+    } catch (error) {
+      setCoinPaymentMessage(error instanceof Error ? error.message : "Could not load Coin payment status.");
+    }
+  }, [accountSession?.authProvider, accountSession?.token, fetchWithAccountSession]);
+
+  useEffect(() => {
+    if (!started || !accountSession?.token || accountSession.authProvider !== "account") return undefined;
+    void refreshCoinPaymentStatus();
+    const query = new URLSearchParams(window.location.search);
+    if (query.get("coinPayment") === "success") {
+      setCoinPaymentMessage("Payment is being confirmed. Coin will arrive automatically.");
+      window.setTimeout(() => void refreshCoinPaymentStatus(), 1_500);
+    } else if (query.get("coinPayment") === "fail") {
+      setCoinPaymentMessage("Payment was not completed.");
+    }
+    const timer = window.setInterval(() => void refreshCoinPaymentStatus(), 60_000);
+    return () => window.clearInterval(timer);
+  }, [accountSession?.authProvider, accountSession?.token, refreshCoinPaymentStatus, started]);
+
+  useEffect(() => {
+    if (coinPaymentStatus?.status !== "pending") return;
+    const timer = window.setInterval(() => void refreshCoinPaymentStatus(), 3_000);
+    return () => window.clearInterval(timer);
+  }, [coinPaymentStatus?.status, refreshCoinPaymentStatus]);
 
   useEffect(() => {
     if (!profileOpen || profileTab !== "map" || !localPlayer) {
@@ -4473,6 +4704,82 @@ export function App() {
     setTeleportMenuOpen(false);
   }
 
+  async function startPremiumTrial(): Promise<void> {
+    if (!accountSession?.token || accountSession.authProvider !== "account" || premiumBusy) {
+      setPremiumMessage("Save your hero to an account before activating Premium.");
+      return;
+    }
+    const bankWindow = window.open("", "darkvell-premium-card");
+    setPremiumBusy(true);
+    setPremiumMessage("");
+    try {
+      const response = await fetchWithAccountSession("/premium/start", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ planId: premiumPlan })
+      });
+      const payload = (await response.json()) as { paymentUrl?: string; message?: string };
+      if (!response.ok || !payload.paymentUrl) throw new Error(payload.message || "Could not open secure card linking.");
+      if (bankWindow) {
+        bankWindow.opener = null;
+        bankWindow.location.assign(payload.paymentUrl);
+      } else {
+        window.location.assign(payload.paymentUrl);
+      }
+      setPremiumMessage("Complete card linking in the T-Bank window. Premium will activate automatically.");
+      await refreshPremiumStatus();
+    } catch (error) {
+      bankWindow?.close();
+      setPremiumMessage(error instanceof Error ? error.message : "Could not open secure card linking.");
+    } finally {
+      setPremiumBusy(false);
+    }
+  }
+
+  async function cancelPremiumRenewal(): Promise<void> {
+    if (!accountSession?.token || accountSession.authProvider !== "account" || premiumBusy) return;
+    setPremiumBusy(true);
+    try {
+      const response = await fetchWithAccountSession("/premium/cancel", { method: "POST" });
+      const payload = (await response.json()) as PremiumStatus & { message?: string };
+      if (!response.ok) throw new Error(payload.message || "Could not cancel renewal.");
+      setPremiumStatus(payload);
+      setPremiumMessage("Renewal canceled. Premium stays active until the shown date.");
+    } catch (error) {
+      setPremiumMessage(error instanceof Error ? error.message : "Could not cancel renewal.");
+    } finally {
+      setPremiumBusy(false);
+    }
+  }
+
+  async function buyOneCoin(): Promise<void> {
+    if (!accountSession?.token || accountSession.authProvider !== "account" || coinPaymentBusy) {
+      setCoinPaymentMessage("Save your hero to an account before buying Coin.");
+      return;
+    }
+    const bankWindow = window.open("", "darkvell-coin-payment");
+    setCoinPaymentBusy(true);
+    setCoinPaymentMessage("");
+    try {
+      const response = await fetchWithAccountSession("/coin-shop/start", { method: "POST" });
+      const payload = (await response.json()) as { paymentUrl?: string; message?: string };
+      if (!response.ok || !payload.paymentUrl) throw new Error(payload.message || "Could not open secure Coin payment.");
+      if (bankWindow) {
+        bankWindow.opener = null;
+        bankWindow.location.assign(payload.paymentUrl);
+      } else {
+        window.location.assign(payload.paymentUrl);
+      }
+      setCoinPaymentMessage("Complete the one-time payment in the T-Bank window.");
+      await refreshCoinPaymentStatus();
+    } catch (error) {
+      bankWindow?.close();
+      setCoinPaymentMessage(error instanceof Error ? error.message : "Could not open secure Coin payment.");
+    } finally {
+      setCoinPaymentBusy(false);
+    }
+  }
+
   function selectTeleportDestination(teleportId: TeleportId) {
     window.dispatchEvent(new CustomEvent("mmo:teleportTo", { detail: { teleportId } }));
     setTeleportMenuOpen(false);
@@ -4854,6 +5161,21 @@ export function App() {
                   </div>
                   <div className="appearancePanel">
                     <div className="appearanceRow">
+                      <strong>{tr("Gender")}</strong>
+                      <div className="appearanceChoices compactAppearanceChoices genderAppearanceChoices">
+                        {genderOptions.map((option) => (
+                          <button
+                            type="button"
+                            className={faceParts.gender === option.id ? "appearanceChoice activeAppearanceChoice" : "appearanceChoice"}
+                            key={option.id}
+                            onClick={() => updateFacePart({ gender: option.id })}
+                          >
+                            {tr(option.label)}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="appearanceRow">
                       <strong>{tr("Hair")}</strong>
                       <div className="appearanceChoices">
                         {hairOptions.map((label, index) => (
@@ -4886,7 +5208,7 @@ export function App() {
                     <div className="appearanceRow">
                       <strong>{tr("Mark")}</strong>
                       <div className="appearanceChoices compactAppearanceChoices">
-                        {markOptions.map((label, index) => (
+                        {activeMarkOptions.map((label, index) => (
                           <button
                             type="button"
                             className={faceParts.mark === index + 1 ? "appearanceChoice activeAppearanceChoice" : "appearanceChoice"}
@@ -4899,20 +5221,24 @@ export function App() {
                       </div>
                     </div>
                   </div>
-                  <div className={`characterPreview race-${race} class-${classId} hair-${faceParts.hair} eyes-${faceParts.eyes} mark-${faceParts.mark}`}>
+                  <div className={`characterPreview race-${race} class-${classId} gender-${faceParts.gender} hair-${faceParts.hair} eyes-${faceParts.eyes} mark-${faceParts.mark}`}>
                     <div className="previewStage">
                       <span className="previewAvatar">
                         <span className="previewCloak" />
                         <span className="previewHead">
+                          <span className="previewEar previewEarLeft" />
+                          <span className="previewEar previewEarRight" />
                           <span className="previewHair" />
                           <span className="previewEyes" />
                           <span className="previewFaceMark" />
+                          <span className="previewTusks" />
                         </span>
                         <span className="previewShoulder previewShoulderLeft" />
                         <span className="previewShoulder previewShoulderRight" />
                         <span className="previewArm previewArmLeft" />
                         <span className="previewArm previewArmRight" />
                         <span className="previewBody" />
+                        <span className="previewBust" />
                         <span className="previewLeg previewLegLeft" />
                         <span className="previewLeg previewLegRight" />
                         <span className="previewBoot previewBootLeft" />
@@ -4923,7 +5249,7 @@ export function App() {
                     <div>
                       <strong>{playerName.trim() || tr("New hero")}</strong>
                       <span>
-                        {tr(raceOptions.find((option) => option.id === race)?.label ?? "")} {tr(classDef.label)}, {tr(hairOptions[faceParts.hair - 1])} {tr("hair")}, {tr(eyeOptions[faceParts.eyes - 1])} {tr("eyes")}
+                        {tr(genderOptions.find((option) => option.id === faceParts.gender)?.label ?? "")} · {tr(raceOptions.find((option) => option.id === race)?.label ?? "")} {tr(classDef.label)}, {tr(hairOptions[faceParts.hair - 1])} {tr("hair")}, {tr(eyeOptions[faceParts.eyes - 1])} {tr("eyes")}
                       </span>
                     </div>
                   </div>
@@ -5088,6 +5414,7 @@ export function App() {
                   {localPlayer?.clanTag ? <span className={`clanBadge clan-${localPlayer.clanEmblem ?? "shield"}`}>{clanEmblemMark(localPlayer.clanEmblem)}</span> : null}
                   {localPlayer?.clanTag ? <span className="statusClanTag">{localPlayer.clanTag}</span> : null}
                   <strong className={localNameState}>{localPlayer?.name ?? playerName}</strong>
+                  {localPlayer?.premium ? <span className="statusPremiumBadge"><Crown size={11} /> Premium</span> : null}
                 </div>
                 <span>
                   {isAdmin && adminState ? `${tr("real")} ${adminState.realOnline}/${adminState.totalOnline}` : `${tr("online")} ${snapshot?.onlineCount ?? 0}`} · {serverClock}
@@ -5951,13 +6278,17 @@ export function App() {
                         <span>{tr(activeClassDef.label)}</span>
                       </div>
                       <div className="paperdoll">
-                        <div className={`paperdollCharacter class-${localPlayer?.classId ?? classId} race-${localPlayer?.race ?? race} ${paperdollAppearanceClasses(equipment)}`}>
+                        <div className={`paperdollCharacter class-${localPlayer?.classId ?? classId} race-${localPlayer?.race ?? race} gender-${decodeFaceVariant(localPlayer?.face ?? face).gender} hair-${decodeFaceVariant(localPlayer?.face ?? face).hair} eyes-${decodeFaceVariant(localPlayer?.face ?? face).eyes} mark-${decodeFaceVariant(localPlayer?.face ?? face).mark} ${paperdollAppearanceClasses(equipment)}`}>
                           <span className="paperdollAvatar">
                             <i className="paperAura" />
                             <i className="paperCloak" />
+                            <i className="paperEar paperEarLeft" />
+                            <i className="paperEar paperEarRight" />
                             <i className="paperHead" />
+                            <i className="paperTusks" />
                             <i className="paperHelmet" />
                             <i className="paperTorso" />
+                            <i className="paperBust" />
                             <i className="paperShoulder paperShoulderLeft" />
                             <i className="paperShoulder paperShoulderRight" />
                             <i className="paperArm paperArmLeft" />
@@ -6226,34 +6557,86 @@ export function App() {
                 ) : null}
 
                 {profileTab === "wallet" ? (
-                  <div className="profilePane walletPane">
-                    <div className="walletLine">
-                      <WalletCards size={18} />
-                      <span>{walletAddress ? `${walletAddress.slice(0, 8)}...${walletAddress.slice(-6)}` : tr("TON temporarily disabled")}</span>
-                    </div>
-                    <button
-                      type="button"
-                      disabled={!walletAddress || claimableToken <= 0}
-                      title={!walletAddress ? tr("TON wallet temporarily disabled") : claimableToken <= 0 ? tr("Need at least 25 gold") : tr(`${claimableGold} gold converts into ${claimableToken} TOKEN`)}
-                      onClick={() => {
-                        if (!walletAddress) {
-                          setClaimStatus("TON wallet temporarily disabled");
-                          return;
-                        }
-                        if (claimableToken <= 0) {
-                          setClaimStatus("Need 25 gold for 1 TOKEN");
-                          return;
-                        }
-                        setClaimStatus(`${claimableGold} gold -> ${claimableToken} TOKEN queued`);
-                        window.dispatchEvent(new CustomEvent("mmo:claimReward", { detail: { walletAddress } }));
-                      }}
-                    >
-                      <Coins size={17} />
-                      {tr("Convert gold")}
-                    </button>
-                    <span className="claimStatus">
-                      {tr(claimStatus)} · {tr("pending")} {walletState.pendingToken} TOKEN
-                    </span>
+                  <div className="profilePane paymentPane">
+                    <section className="premiumPane">
+                      <section className="premiumHeroCard">
+                        <div className="premiumCrown"><Crown size={34} /></div>
+                        <div>
+                          <span className="premiumEyebrow">DARKVELL PREMIUM</span>
+                          <h2>{tr("Level up twice as fast")}</h2>
+                          <p>{tr("24 hours free, then the selected plan renews automatically. Cancel anytime.")}</p>
+                        </div>
+                        {premiumStatus?.mode === "demo" ? <em className="premiumDemoBadge">DEMO</em> : null}
+                      </section>
+
+                      <div className="premiumBenefitGrid">
+                        <article><strong>×2 XP</strong><span>{tr("Experience from monsters")}</span></article>
+                        <article><strong>×2</strong><span>{tr("Adena and gold from monsters and chests")}</span></article>
+                        <article><strong>+50%</strong><span>{tr("Rare monster loot chance")}</span></article>
+                        <article><strong>×2</strong><span>{tr("Rest regeneration")}</span></article>
+                      </div>
+
+                      {premiumStatus?.active ? (
+                        <section className="premiumActiveCard">
+                          <Crown size={28} />
+                          <div>
+                            <strong>{premiumStatus.status === "trial" ? tr("Premium trial is active") : tr("Premium is active")}</strong>
+                            <span>{tr("Active until")} {premiumStatus.premiumUntil ? new Date(premiumStatus.premiumUntil).toLocaleString(language === "ru" ? "ru-RU" : "en-US") : "—"}</span>
+                          </div>
+                          {!premiumStatus.cancelAtPeriodEnd ? (
+                            <button type="button" disabled={premiumBusy} onClick={() => void cancelPremiumRenewal()}>{tr("Cancel renewal")}</button>
+                          ) : <em>{tr("Renewal canceled")}</em>}
+                        </section>
+                      ) : (
+                        <>
+                          <div className="premiumPlans" role="radiogroup" aria-label={tr("Premium plan")}>
+                            <button type="button" className={premiumPlan === "week" ? "premiumPlan selectedPremiumPlan" : "premiumPlan"} onClick={() => setPremiumPlan("week")}>
+                              <span>{tr("Week")}</span><strong>150 ₽</strong><small>{tr("every 7 days")}</small>
+                            </button>
+                            <button type="button" className={premiumPlan === "month" ? "premiumPlan selectedPremiumPlan recommendedPremiumPlan" : "premiumPlan recommendedPremiumPlan"} onClick={() => setPremiumPlan("month")}>
+                              <em>{tr("Best value")}</em><span>{tr("Month")}</span><strong>404 ₽</strong><small>{tr("every 30 days")}</small>
+                            </button>
+                          </div>
+                          <button
+                            type="button"
+                            className="premiumActivateButton"
+                            disabled={premiumBusy || premiumStatus?.enabled === false || premiumStatus?.canStartTrial === false}
+                            onClick={() => void startPremiumTrial()}
+                          >
+                            <Crown size={19} />
+                            {premiumStatus?.status === "pending" ? tr("Continue card linking") : tr("Activate 24 hours free")}
+                          </button>
+                          <p className="premiumConsent">
+                            {tr(`By activating, you link your card through T-Bank and agree that ${premiumPlan === "week" ? "150 ₽ every 7 days" : "404 ₽ every 30 days"} will be charged automatically after the free 24 hours until canceled.`)}
+                          </p>
+                        </>
+                      )}
+                      {premiumMessage || premiumStatus?.lastError ? <div className="premiumMessage">{tr(premiumMessage || premiumStatus?.lastError || "")}</div> : null}
+                      <small className="premiumSecureNote">{tr("T-Bank may temporarily charge 1 ₽ to verify and save the card; DarkVell refunds it immediately.")}</small>
+                      <small className="premiumSecureNote">{tr("Card number and CVC are entered only on the secure T-Bank page and are never stored by DarkVell.")}</small>
+                    </section>
+
+                    <section className="coinShopCard">
+                      <div className="coinShopArt"><Coins size={32} /></div>
+                      <div className="coinShopCopy">
+                        <span className="premiumEyebrow">DARKVELL COIN</span>
+                        <strong>{tr("1 Coin for 1 ₽")}</strong>
+                        <small>{tr("One-time payment. No subscription and no automatic renewal.")}</small>
+                        <em>{tr("In inventory now")}: {coinCount.toLocaleString(language === "ru" ? "ru-RU" : "en-US")} Coin</em>
+                      </div>
+                      {coinPaymentStatus?.mode === "demo" ? <b className="premiumDemoBadge">DEMO</b> : null}
+                      <button
+                        type="button"
+                        className="coinBuyButton"
+                        disabled={coinPaymentBusy || coinPaymentStatus?.enabled === false}
+                        onClick={() => void buyOneCoin()}
+                      >
+                        <Coins size={18} />
+                        {coinPaymentStatus?.status === "pending" ? tr("Continue payment") : tr("Buy 1 Coin for 1 ₽")}
+                      </button>
+                      {coinPaymentMessage ? <p className="coinPaymentMessage">{tr(coinPaymentMessage)}</p> : null}
+                      <small className="coinShopSecure">{tr("Payment details are entered only on the secure T-Bank page.")}</small>
+                    </section>
                   </div>
                 ) : null}
 

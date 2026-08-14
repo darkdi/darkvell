@@ -1,6 +1,8 @@
-import { Body, Controller, Get, Headers, Inject, Post } from "@nestjs/common";
+import { Body, Controller, Get, Header, Headers, Inject, Post } from "@nestjs/common";
 import type { CharacterClass, CharacterRace } from "@mmo/shared";
 import { AuthService } from "./auth.service.js";
+import { PremiumService, type PremiumPlanId } from "./premium.service.js";
+import { CoinPaymentService } from "./coin-payment.service.js";
 
 interface TelegramLoginBody {
   initData?: string;
@@ -12,7 +14,11 @@ type AuthLocale = "ru" | "en";
 
 @Controller()
 export class AuthController {
-  constructor(@Inject(AuthService) private readonly auth: AuthService) {}
+  constructor(
+    @Inject(AuthService) private readonly auth: AuthService,
+    @Inject(PremiumService) private readonly premium: PremiumService,
+    @Inject(CoinPaymentService) private readonly coinPayment: CoinPaymentService
+  ) {}
 
   @Get("/health")
   health() {
@@ -72,6 +78,11 @@ export class AuthController {
     return this.auth.login(body);
   }
 
+  @Post("/account/session/refresh")
+  accountSessionRefresh(@Headers("authorization") authorization?: string) {
+    return this.auth.refreshAccountSession(authorization?.replace(/^Bearer\s+/i, "").trim());
+  }
+
   @Post("/account/password/reset/request-code")
   accountPasswordResetCode(@Body() body: { login?: string; locale?: AuthLocale }) {
     return this.auth.requestPasswordResetCode(body);
@@ -90,6 +101,46 @@ export class AuthController {
   @Post("/account/character/head")
   accountCharacterHead(@Body() body: { token?: string; imageData?: string; clear?: boolean }) {
     return this.auth.updateCharacterHead(body);
+  }
+
+  @Get("/premium/status")
+  premiumStatus(@Headers("authorization") authorization?: string) {
+    return this.premium.status(authorization?.replace(/^Bearer\s+/i, "").trim());
+  }
+
+  @Post("/premium/start")
+  premiumStart(
+    @Headers("authorization") authorization: string | undefined,
+    @Body() body: { planId?: PremiumPlanId }
+  ) {
+    return this.premium.start(authorization?.replace(/^Bearer\s+/i, "").trim(), body.planId);
+  }
+
+  @Post("/premium/cancel")
+  premiumCancel(@Headers("authorization") authorization?: string) {
+    return this.premium.cancel(authorization?.replace(/^Bearer\s+/i, "").trim());
+  }
+
+  @Post("/premium/tbank/notification")
+  @Header("content-type", "text/plain; charset=utf-8")
+  premiumTbankNotification(@Body() body: Record<string, unknown>) {
+    return this.premium.notification(body);
+  }
+
+  @Get("/coin-shop/status")
+  coinShopStatus(@Headers("authorization") authorization?: string) {
+    return this.coinPayment.status(authorization?.replace(/^Bearer\s+/i, "").trim());
+  }
+
+  @Post("/coin-shop/start")
+  coinShopStart(@Headers("authorization") authorization?: string) {
+    return this.coinPayment.start(authorization?.replace(/^Bearer\s+/i, "").trim());
+  }
+
+  @Post("/coin-shop/tbank/notification")
+  @Header("content-type", "text/plain; charset=utf-8")
+  coinShopTbankNotification(@Body() body: Record<string, unknown>) {
+    return this.coinPayment.notification(body);
   }
 
   @Get("/admin/characters")

@@ -57,12 +57,18 @@ import {
 import { defaultMobileGraphicsSettings, isMobileGameRuntime, normalizeMobileGraphicsSettings, type MobileGraphicsSettings } from "./performanceSettings";
 import { touchDiag } from "./touchDiagnostics";
 import {
+  ensurePlayerCharacterTextures,
+  PLAYER_CHARACTER_SCALE,
+  type PlayerCharacterFrame
+} from "./playerCharacterArt";
+import {
   WORLD_FOLIAGE_ATLAS_KEY,
   preloadWorldFoliageAssets,
   worldFoliageFormForFrame,
   worldFoliagePaletteFor,
   type WorldFoliageForm
 } from "./worldFoliageAssets";
+import { preloadWorldTerrainSpriteAssets, WORLD_TERRAIN_SPRITE_KEYS } from "./worldTerrainSpriteAssets";
 
 const DARKVELL_SHOWCASE_DUNGEON = WORLD_DUNGEON_INTERIORS.find(
   (dungeon) => dungeon.id === BESTIARY_CAVERN_DUNGEON_ID
@@ -189,6 +195,25 @@ interface TerrainPatch {
   height: number;
   alpha: number;
   depth: number;
+  maskId?: string;
+}
+
+interface AnimatedWaterSurface {
+  primary: Phaser.GameObjects.TileSprite;
+  secondary: Phaser.GameObjects.TileSprite;
+  maskSource: Phaser.GameObjects.Graphics;
+  mask: Phaser.Display.Masks.GeometryMask;
+  baseTileX: number;
+  baseTileY: number;
+  phase: number;
+  position: Vector2;
+}
+
+interface AnimatedWaterRouteTile {
+  tile: Phaser.GameObjects.TileSprite;
+  baseTileX: number;
+  baseTileY: number;
+  speed: number;
 }
 
 interface StaticMapGraphicsLayer {
@@ -232,6 +257,7 @@ interface TouchStick {
 interface NetworkPositionSample {
   position: Vector2;
   serverTime: number;
+  receivedAt: number;
 }
 
 interface SingingAudioHandle {
@@ -275,8 +301,11 @@ const playerColors: Record<string, number> = {
   archer: 0x22c55e,
   tank: 0xf59e0b
 };
+const WORLD_WATER_CORE_COLOR = 0x49bfd1;
+const WORLD_WATER_EDGE_COLOR = 0x8ee4cf;
 const INPUT_SEND_INTERVAL_MS = 33;
 const MOBILE_INPUT_SEND_INTERVAL_MS = 33;
+const LOCAL_PREDICTION_MAX_FRAME_SECONDS = 0.1;
 const LOCAL_MOVEMENT_GRACE_MS = 850;
 const LOCAL_STOP_SETTLE_MS = 260;
 const LOCAL_STOP_SETTLE_DEADBAND = 14;
@@ -300,9 +329,11 @@ const REMOTE_MOBILE_MONSTER_INTERPOLATION_DELAY_MS = 138;
 // Keep remote actors moving through one short VPN/TCP jitter gap. The value is
 // still bounded so a genuinely stale actor cannot run far away from the server.
 const REMOTE_EXTRAPOLATE_LIMIT_MS = 180;
-const REMOTE_PLAYER_MAX_INTERPOLATION_DELAY_MS = 210;
-const REMOTE_MONSTER_MAX_INTERPOLATION_DELAY_MS = 240;
-const REMOTE_MOBILE_MAX_INTERPOLATION_DELAY_MS = 320;
+const REMOTE_MAX_EXTRAPOLATE_LIMIT_MS = 360;
+const REMOTE_MOBILE_MAX_EXTRAPOLATE_LIMIT_MS = 440;
+const REMOTE_PLAYER_MAX_INTERPOLATION_DELAY_MS = 360;
+const REMOTE_MONSTER_MAX_INTERPOLATION_DELAY_MS = 390;
+const REMOTE_MOBILE_MAX_INTERPOLATION_DELAY_MS = 460;
 const REMOTE_NETWORK_HISTORY_LIMIT = 8;
 const MONSTER_SPAWN_FADE_MS = 360;
 const MAX_CLASS_AIM_RADIUS = Math.ceil(
@@ -655,7 +686,16 @@ export class WorldScene extends Phaser.Scene {
   private readonly resources = new Map<string, Phaser.GameObjects.Image>();
   private readonly groundItems = new Map<string, GroundItemView>();
   private readonly terrainPatches: TerrainPatch[] = [];
-  private readonly terrainTiles = new Map<string, Phaser.GameObjects.TileSprite>();
+  private readonly terrainTiles = new Map<string, Phaser.GameObjects.TileSprite | Phaser.GameObjects.Image>();
+  private readonly terrainPatchMasks = new Map<
+    string,
+    { source: Phaser.GameObjects.Graphics; mask: Phaser.Display.Masks.GeometryMask }
+  >();
+  private readonly animatedWaterTerrainTiles = new Set<Phaser.GameObjects.TileSprite>();
+  private readonly animatedWaterSurfaces: AnimatedWaterSurface[] = [];
+  private readonly animatedWaterRouteTiles: AnimatedWaterRouteTile[] = [];
+  private dungeonBackdrop?: Phaser.GameObjects.Rectangle;
+  private lastTerrainSpriteAnimationAt = 0;
   private readonly staticMapGraphicsLayers: StaticMapGraphicsLayer[] = [];
   private lastStaticMapLayerUpdateAt = 0;
   private lastStaticMapLayerViewport?: { x: number; y: number; zoom: number };
@@ -851,13 +891,15 @@ export class WorldScene extends Phaser.Scene {
     preloadMonsterSpriteAssets(this);
     preloadDarkVellOriginalAssets(this);
     preloadWorldFoliageAssets(this);
+    preloadWorldTerrainSpriteAssets(this);
   }
 
   create(): void {
+    const previewParams = typeof window !== "undefined" ? new URLSearchParams(window.location.search) : undefined;
     const localPreviewBridge =
       typeof window !== "undefined" &&
       (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1") &&
-      new URLSearchParams(window.location.search).has("previewActive");
+      previewParams?.has("previewActive");
     if (import.meta.env.DEV || localPreviewBridge) {
       (window as unknown as { __scene?: WorldScene }).__scene = this;
     }
@@ -872,6 +914,9 @@ export class WorldScene extends Phaser.Scene {
     this.mobileAutoTarget = this.loadMobileAutoTarget();
     this.setMobileGraphicsSettings(this.mobileGraphics);
     this.createWorldTextures();
+    Object.values(WORLD_TERRAIN_SPRITE_KEYS).forEach((key) => {
+      this.textures.get(key).setFilter(Phaser.Textures.FilterMode.LINEAR);
+    });
     // These large source sprites are rendered at fractional downscales. Linear sampling keeps
     // their pixels stable while the camera moves instead of producing nearest-neighbour shimmer.
     this.textures.get(WORLD_FOLIAGE_ATLAS_KEY).setFilter(Phaser.Textures.FilterMode.LINEAR);
@@ -908,6 +953,7 @@ export class WorldScene extends Phaser.Scene {
       this.lastStaticMapLayerViewport = undefined;
       this.mobileScenery?.destroy();
       this.mobileScenery = undefined;
+      this.destroyAnimatedTerrainSprites();
       this.destroyWorldFoliage();
       this.worldFoliagePreviewDiagnostics?.remove();
       this.worldFoliagePreviewDiagnostics = undefined;
@@ -950,11 +996,16 @@ export class WorldScene extends Phaser.Scene {
         this.layoutTouchControls();
       }
       const localView = this.localPlayerId ? this.players.get(this.localPlayerId) : undefined;
-      this.cameras.main.centerOn(localView?.body.x ?? localPlayer.position.x, (localView?.body.y ?? localPlayer.position.y) - this.cameraVerticalOffset());
+      this.cameras.main.centerOn(
+        localView?.body.x ?? localPlayer.position.x,
+        (localView?.body.y ?? localPlayer.position.y) - this.cameraVerticalOffset()
+      );
     }
+    this.updateDungeonBackdrop(localPlayer);
 
     this.updateStaticMapGraphicsLayers(time);
     this.updateTerrainTiles(time);
+    this.updateTerrainSpriteAnimation(time);
     this.updateAmbientLayer(time);
     if (mobile && !this.usesMobileFullWorldMap() && !this.mobileSustainedLeanRuntime && this.mobileGraphics.worldDecorations) {
       this.updateMobileScenery(time);
@@ -1474,7 +1525,7 @@ export class WorldScene extends Phaser.Scene {
       }
     });
     create("tile-water", 256, 256, (graphics) => {
-      graphics.fillStyle(0x54b7cf, 1);
+      graphics.fillStyle(WORLD_WATER_CORE_COLOR, 1);
       graphics.fillRect(0, 0, 256, 256);
       graphics.fillStyle(0x7dd3fc, 0.22);
       graphics.fillEllipse(78, 58, 170, 64);
@@ -2094,78 +2145,6 @@ export class WorldScene extends Phaser.Scene {
       graphics.lineStyle(2, 0xc4b5fd, 0.72);
       graphics.strokeCircle(32, 34, 20);
     });
-
-    const createCharacter = (key: string, primary: number, secondary: number, metal: number, accent: number, silhouette: "heavy" | "light" | "robe", headless = false) => {
-      create(key, 96, 116, (graphics) => {
-        const heavy = silhouette === "heavy";
-        const robe = silhouette === "robe";
-        graphics.fillStyle(0x020617, 0.34);
-        graphics.fillEllipse(48, 102, heavy ? 62 : 52, 15);
-        graphics.fillStyle(0x111827, 0.65);
-        graphics.fillEllipse(48, 68, heavy ? 50 : 42, robe ? 58 : 48);
-        graphics.fillStyle(primary, 0.34);
-        graphics.fillTriangle(48, 34, heavy ? 14 : 20, 101, heavy ? 82 : 76, 101);
-        graphics.fillStyle(secondary, 1);
-        if (robe) {
-          graphics.fillTriangle(48, 28, 22, 96, 74, 96);
-          graphics.fillRoundedRect(31, 42, 34, 42, 10);
-        } else {
-          graphics.fillRoundedRect(31, 42, 34, 42, 9);
-          graphics.fillRoundedRect(24, 50, 14, 30, 7);
-          graphics.fillRoundedRect(58, 50, 14, 30, 7);
-        }
-        graphics.fillStyle(primary, 1);
-        graphics.fillRoundedRect(34, 38, 28, 42, 8);
-        graphics.fillStyle(metal, 0.92);
-        graphics.fillEllipse(30, 45, heavy ? 22 : 16, heavy ? 13 : 10);
-        graphics.fillEllipse(66, 45, heavy ? 22 : 16, heavy ? 13 : 10);
-        graphics.fillRoundedRect(30, 45, 9, 30, 4);
-        graphics.fillRoundedRect(57, 45, 9, 30, 4);
-        if (!headless) {
-          graphics.fillStyle(0xf1c27d, 1);
-          graphics.fillCircle(48, 26, 12);
-          graphics.fillStyle(0x1f2937, 0.95);
-          graphics.fillTriangle(31, 29, 48, 10, 65, 29);
-          if (heavy) {
-            graphics.fillStyle(metal, 1);
-            graphics.fillRoundedRect(26, 31, 44, 10, 5);
-            graphics.fillRect(33, 20, 30, 10);
-          }
-        }
-        if (silhouette === "light") {
-          graphics.lineStyle(2, accent, 0.34);
-          graphics.lineBetween(35, 38, 61, 78);
-          graphics.lineBetween(61, 38, 35, 78);
-        }
-        if (robe) {
-          graphics.lineStyle(2, accent, 0.32);
-          graphics.strokeCircle(48, 58, 17);
-        }
-        if (!headless) {
-          graphics.fillStyle(accent, 0.7);
-          graphics.fillCircle(43, 25, 2);
-          graphics.fillCircle(53, 25, 2);
-        }
-        graphics.lineStyle(2, accent, 0.24);
-        graphics.lineBetween(36, 55, 60, 55);
-        graphics.fillStyle(0x111827, 0.82);
-        graphics.fillRoundedRect(33, 82, 11, 22, 4);
-        graphics.fillRoundedRect(52, 82, 11, 22, 4);
-        graphics.fillStyle(metal, 0.78);
-        graphics.fillRect(31, 101, 15, 6);
-        graphics.fillRect(50, 101, 15, 6);
-      });
-    };
-    createCharacter("char-warrior", 0xa51b1b, 0x5b1111, 0xcbd5e1, 0xfef3c7, "heavy");
-    createCharacter("char-assassin", 0x4c1d95, 0x111827, 0xc4b5fd, 0xc084fc, "light");
-    createCharacter("char-mage", 0x0e7490, 0x172554, 0x7dd3fc, 0x7dd3fc, "robe");
-    createCharacter("char-archer", 0x166534, 0x263a20, 0xd6a15d, 0xbbf7d0, "light");
-    createCharacter("char-tank", 0x92400e, 0x3f2a14, 0xfacc15, 0xfef3c7, "heavy");
-    createCharacter("char-warrior-headless", 0xa51b1b, 0x5b1111, 0xcbd5e1, 0xfef3c7, "heavy", true);
-    createCharacter("char-assassin-headless", 0x4c1d95, 0x111827, 0xc4b5fd, 0xc084fc, "light", true);
-    createCharacter("char-mage-headless", 0x0e7490, 0x172554, 0x7dd3fc, 0x7dd3fc, "robe", true);
-    createCharacter("char-archer-headless", 0x166534, 0x263a20, 0xd6a15d, 0xbbf7d0, "light", true);
-    createCharacter("char-tank-headless", 0x92400e, 0x3f2a14, 0xfacc15, 0xfef3c7, "heavy", true);
 
     create("mob-wolf", 86, 58, (graphics) => {
       graphics.fillStyle(0x050505, 0.28);
@@ -3049,105 +3028,214 @@ export class WorldScene extends Phaser.Scene {
       graphics.fillCircle(61, 15, 5);
     });
     create("weapon-warrior", 84, 84, (graphics) => {
-      graphics.lineStyle(8, 0xe5e7eb, 1);
-      graphics.lineBetween(24, 70, 60, 16);
-      graphics.lineStyle(4, 0x94a3b8, 1);
-      graphics.lineBetween(31, 61, 56, 22);
-      graphics.fillStyle(0xf8fafc, 1);
-      graphics.fillTriangle(62, 13, 56, 29, 68, 25);
+      graphics.fillStyle(0x111827, 1);
+      graphics.fillPoints(
+        [
+          { x: 15, y: 76 },
+          { x: 20, y: 68 },
+          { x: 27, y: 73 },
+          { x: 21, y: 81 }
+        ],
+        true
+      );
       graphics.lineStyle(6, 0x78350f, 1);
-      graphics.lineBetween(18, 75, 30, 62);
-      graphics.lineStyle(5, 0xf59e0b, 0.85);
-      graphics.lineBetween(25, 58, 44, 71);
+      graphics.lineBetween(21, 72, 31, 60);
+      graphics.lineStyle(5, 0xf59e0b, 0.9);
+      graphics.lineBetween(25, 58, 40, 70);
+      graphics.fillStyle(0x94a3b8, 1);
+      graphics.fillPoints(
+        [
+          { x: 29, y: 62 },
+          { x: 56, y: 23 },
+          { x: 65, y: 13 },
+          { x: 61, y: 29 },
+          { x: 36, y: 67 }
+        ],
+        true
+      );
+      graphics.fillStyle(0xf8fafc, 1);
+      graphics.fillPoints(
+        [
+          { x: 32, y: 60 },
+          { x: 58, y: 23 },
+          { x: 65, y: 13 },
+          { x: 37, y: 64 }
+        ],
+        true
+      );
+      graphics.lineStyle(2, 0xffffff, 0.74);
+      graphics.lineBetween(36, 58, 62, 20);
     });
     create("weapon-assassin", 84, 84, (graphics) => {
-      const drawDaggerPath = (points: Vector2[], color: number, alpha: number, width: number) => {
-        graphics.lineStyle(width, color, alpha);
-        graphics.beginPath();
-        graphics.moveTo(points[0].x, points[0].y);
-        points.slice(1).forEach((point) => graphics.lineTo(point.x, point.y));
-        graphics.strokePath();
-      };
-      const drawCurvedDagger = (mirrored: boolean) => {
-        const mirrorY = (y: number) => (mirrored ? 84 - y : y);
-        const outer = [
-          { x: 33, y: 28 },
-          { x: 43, y: 25 },
-          { x: 52, y: 20 },
-          { x: 62, y: 22 },
-          { x: 58, y: 28 },
-          { x: 51, y: 33 },
-          { x: 42, y: 37 },
-          { x: 34, y: 40 },
-          { x: 31, y: 36 }
-        ].map((point) => ({ x: point.x, y: mirrorY(point.y) }));
-        const inner = [
-          { x: 35, y: 29 },
-          { x: 44, y: 27 },
-          { x: 52, y: 22 },
-          { x: 60, y: 23 },
-          { x: 56, y: 28 },
-          { x: 49, y: 32 },
-          { x: 42, y: 35 },
-          { x: 35, y: 38 },
-          { x: 34, y: 34 }
-        ].map((point) => ({ x: point.x, y: mirrorY(point.y) }));
-        const handleY = mirrorY(34);
-        graphics.lineStyle(8, 0x160d20, 1);
-        graphics.lineBetween(20, handleY, 34, handleY);
-        graphics.lineStyle(3, 0x6d28d9, 0.92);
-        graphics.lineBetween(20, handleY, 33, handleY);
+      const drawShadowBlade = (grip: Vector2, tip: Vector2, halfWidth: number, accent: number) => {
+        const dx = tip.x - grip.x;
+        const dy = tip.y - grip.y;
+        const length = Math.max(1, Math.hypot(dx, dy));
+        const forward = { x: dx / length, y: dy / length };
+        const side = { x: -forward.y, y: forward.x };
+        const point = (distance: number, offset = 0): Vector2 => ({
+          x: grip.x + forward.x * distance + side.x * offset,
+          y: grip.y + forward.y * distance + side.y * offset
+        });
+
         graphics.fillStyle(0x160d20, 1);
-        graphics.fillCircle(20, handleY, 4);
-        graphics.fillStyle(0xa855f7, 0.9);
-        graphics.fillCircle(20, handleY, 2);
+        graphics.fillPoints(
+          [
+            point(-15, 0),
+            point(-10, -4.5),
+            point(1, -3),
+            point(1, 3),
+            point(-10, 4.5)
+          ],
+          true
+        );
+        graphics.fillStyle(accent, 0.98);
+        graphics.fillPoints([point(-10, -2), point(1, -2), point(1, 2), point(-10, 2)], true);
         graphics.fillStyle(0x160d20, 1);
-        graphics.fillPoints(outer, true);
-        graphics.fillStyle(0xaebdce, 1);
-        graphics.fillPoints(inner, true);
-        drawDaggerPath(
+        graphics.fillPoints(
           [
-            { x: 35, y: mirrorY(38) },
-            { x: 42, y: mirrorY(35) },
-            { x: 49, y: mirrorY(32) },
-            { x: 56, y: mirrorY(28) },
-            { x: 60, y: mirrorY(23) }
+            point(-1, -9),
+            point(5, -4),
+            point(5, 4),
+            point(-1, 9)
           ],
-          0xf8fafc,
-          0.88,
-          1.8
+          true
         );
-        drawDaggerPath(
+        graphics.fillStyle(0x94a3b8, 1);
+        graphics.fillPoints(
           [
-            { x: 36, y: mirrorY(31) },
-            { x: 44, y: mirrorY(28) },
-            { x: 52, y: mirrorY(23) },
-            { x: 58, y: mirrorY(24) }
+            point(3, -halfWidth * 0.72),
+            point(length - 12, -halfWidth),
+            point(length, 0),
+            point(length - 12, halfWidth),
+            point(3, halfWidth * 0.72)
           ],
-          0x6d28d9,
-          0.72,
-          1.35
+          true
         );
-        graphics.lineStyle(5, 0x160d20, 1);
-        graphics.lineBetween(32, mirrorY(27), 37, mirrorY(40));
-        graphics.lineStyle(2, 0xc084fc, 0.92);
-        graphics.lineBetween(32, mirrorY(27), 37, mirrorY(40));
+        graphics.fillStyle(0xe2e8f0, 0.98);
+        graphics.fillPoints(
+          [
+            point(6, -halfWidth * 0.42),
+            point(length - 11, -halfWidth * 0.62),
+            point(length, 0),
+            point(8, 0)
+          ],
+          true
+        );
+        const grooveStart = point(9, 0);
+        const grooveEnd = point(length - 5, 0);
+        graphics.lineStyle(2, 0xc084fc, 0.88);
+        graphics.lineBetween(grooveStart.x, grooveStart.y, grooveEnd.x, grooveEnd.y);
       };
-      drawCurvedDagger(false);
-      drawCurvedDagger(true);
+      // Uneven forward-facing pair: readable dual wield without the old symmetric propeller.
+      drawShadowBlade({ x: 30, y: 43 }, { x: 77, y: 28 }, 7.2, 0x7c3aed);
+      drawShadowBlade({ x: 29, y: 51 }, { x: 64, y: 65 }, 6.1, 0x4c1d95);
+    });
+    create("projectile-assassin-blade", 72, 28, (graphics) => {
+      graphics.fillStyle(0x160d20, 1);
+      graphics.fillPoints(
+        [
+          { x: 3, y: 14 },
+          { x: 9, y: 9 },
+          { x: 23, y: 11 },
+          { x: 23, y: 17 },
+          { x: 9, y: 19 }
+        ],
+        true
+      );
+      graphics.fillStyle(0x6d28d9, 0.95);
+      graphics.fillRect(9, 12, 16, 4);
+      graphics.fillStyle(0x160d20, 1);
+      graphics.fillPoints(
+        [
+          { x: 21, y: 5 },
+          { x: 29, y: 10 },
+          { x: 29, y: 18 },
+          { x: 21, y: 23 }
+        ],
+        true
+      );
+      graphics.fillStyle(0xaebdce, 1);
+      graphics.fillPoints(
+        [
+          { x: 27, y: 9 },
+          { x: 58, y: 6 },
+          { x: 69, y: 14 },
+          { x: 58, y: 22 },
+          { x: 27, y: 19 }
+        ],
+        true
+      );
+      graphics.fillStyle(0xf8fafc, 0.94);
+      graphics.fillPoints(
+        [
+          { x: 30, y: 10 },
+          { x: 58, y: 8 },
+          { x: 69, y: 14 },
+          { x: 34, y: 14 }
+        ],
+        true
+      );
+      graphics.lineStyle(2, 0xc084fc, 0.86);
+      graphics.lineBetween(33, 14, 64, 14);
     });
     create("weapon-tank", 84, 84, (graphics) => {
-      graphics.fillStyle(0x92400e, 1);
-      graphics.fillCircle(38, 42, 27);
-      graphics.lineStyle(6, 0xfcd34d, 0.95);
-      graphics.strokeCircle(38, 42, 27);
-      graphics.lineStyle(4, 0xfef3c7, 0.72);
-      graphics.lineBetween(38, 17, 38, 67);
-      graphics.lineBetween(13, 42, 63, 42);
-      graphics.lineStyle(6, 0xd1d5db, 1);
-      graphics.lineBetween(20, 76, 66, 18);
-      graphics.fillStyle(0xf59e0b, 0.95);
-      graphics.fillCircle(67, 17, 7);
+      graphics.fillStyle(0x7c2d12, 1);
+      graphics.fillCircle(35, 43, 25);
+      graphics.lineStyle(5, 0xfcd34d, 0.96);
+      graphics.strokeCircle(35, 43, 25);
+      graphics.fillStyle(0xf59e0b, 0.42);
+      graphics.fillPoints(
+        [
+          { x: 35, y: 23 },
+          { x: 51, y: 37 },
+          { x: 45, y: 58 },
+          { x: 25, y: 58 },
+          { x: 19, y: 37 }
+        ],
+        true
+      );
+      graphics.lineStyle(3, 0xfef3c7, 0.68);
+      graphics.lineBetween(35, 24, 35, 61);
+      graphics.lineBetween(18, 43, 52, 43);
+
+      graphics.fillStyle(0x1f2937, 1);
+      graphics.fillPoints(
+        [
+          { x: 15, y: 76 },
+          { x: 20, y: 68 },
+          { x: 27, y: 73 },
+          { x: 21, y: 81 }
+        ],
+        true
+      );
+      graphics.lineStyle(8, 0x78350f, 1);
+      graphics.lineBetween(21, 72, 31, 60);
+      graphics.lineStyle(5, 0xf59e0b, 0.96);
+      graphics.lineBetween(25, 58, 39, 70);
+      graphics.fillStyle(0x94a3b8, 1);
+      graphics.fillPoints(
+        [
+          { x: 29, y: 62 },
+          { x: 55, y: 27 },
+          { x: 63, y: 31 },
+          { x: 36, y: 67 }
+        ],
+        true
+      );
+      graphics.fillStyle(0xe5e7eb, 1);
+      graphics.fillPoints(
+        [
+          { x: 31, y: 60 },
+          { x: 60, y: 21 },
+          { x: 67, y: 12 },
+          { x: 63, y: 31 },
+          { x: 56, y: 28 }
+        ],
+        true
+      );
+      graphics.lineStyle(2, 0xfef3c7, 0.8);
+      graphics.lineBetween(36, 58, 63, 21);
     });
     create("weapon-microphone", 84, 84, (graphics) => {
       graphics.fillStyle(0x020617, 0.32);
@@ -3203,49 +3291,21 @@ export class WorldScene extends Phaser.Scene {
     });
     createWeaponGlow("warrior", (graphics, width, alpha) => {
       graphics.lineStyle(width, 0xffffff, alpha);
-      graphics.lineBetween(24, 70, 60, 16);
+      graphics.lineBetween(29, 64, 63, 17);
     });
     createWeaponGlow("assassin", (graphics, width, alpha) => {
-      const drawGlowPath = (points: Vector2[], lineWidth: number, lineAlpha: number) => {
-        graphics.lineStyle(lineWidth, 0xffffff, lineAlpha);
-        graphics.beginPath();
-        graphics.moveTo(points[0].x, points[0].y);
-        points.slice(1).forEach((point) => graphics.lineTo(point.x, point.y));
-        graphics.strokePath();
-      };
-      const drawBladeGlow = (mirrored: boolean) => {
-        const mirrorY = (y: number) => (mirrored ? 84 - y : y);
-        drawGlowPath(
-          [
-            { x: 35, y: mirrorY(38) },
-            { x: 41, y: mirrorY(36) },
-            { x: 47, y: mirrorY(33) },
-            { x: 53, y: mirrorY(29) },
-            { x: 58, y: mirrorY(25) },
-            { x: 61, y: mirrorY(23) }
-          ],
-          Math.max(1.6, width * 0.58),
-          Math.min(1, alpha * 1.08)
-        );
-        drawGlowPath(
-          [
-            { x: 35, y: mirrorY(30) },
-            { x: 43, y: mirrorY(27) },
-            { x: 52, y: mirrorY(22) },
-            { x: 60, y: mirrorY(23) }
-          ],
-          Math.max(1.25, width * 0.34),
-          alpha * 0.45
-        );
-      };
-      drawBladeGlow(false);
-      drawBladeGlow(true);
+      graphics.lineStyle(Math.max(1.5, width * 0.58), 0xffffff, Math.min(1, alpha * 1.08));
+      graphics.lineBetween(35, 41, 76, 28);
+      graphics.lineBetween(34, 53, 63, 65);
+      graphics.lineStyle(Math.max(1.2, width * 0.3), 0xffffff, alpha * 0.42);
+      graphics.lineBetween(38, 40, 72, 30);
+      graphics.lineBetween(37, 54, 60, 63);
     });
     createWeaponGlow("tank", (graphics, width, alpha) => {
       graphics.lineStyle(Math.max(2, width * 0.58), 0xffffff, alpha * 0.7);
-      graphics.strokeCircle(38, 42, 27);
+      graphics.strokeCircle(35, 43, 25);
       graphics.lineStyle(width, 0xffffff, alpha);
-      graphics.lineBetween(20, 76, 66, 18);
+      graphics.lineBetween(31, 63, 65, 17);
     });
     create("skill-cleave", 96, 96, (graphics) => {
       graphics.lineStyle(10, 0xf8fafc, 0.92);
@@ -3323,6 +3383,8 @@ export class WorldScene extends Phaser.Scene {
       "decor-rock",
       "decor-rock-flat"
     ]);
+    const skipRepeatedGroundScatter = (texture: string) =>
+      texture === "decor-grass" || texture === "decor-pebble" || texture === "decor-rock-flat";
     const decorationRotation = (texture: string, fallback: number, index: number) => {
       if (uprightTextures.has(texture)) {
         return 0;
@@ -3391,6 +3453,9 @@ export class WorldScene extends Phaser.Scene {
         const x = center.x + Math.cos(angle) * (width / 2) * radius;
         const y = center.y + Math.sin(angle) * (height / 2) * radius;
         const selectedTexture = Array.isArray(texture) ? texture[index % texture.length] : texture;
+        if (skipRepeatedGroundScatter(selectedTexture)) {
+          continue;
+        }
         if (Phaser.Math.Distance.Between(x, y, WORLD_BOUNDS.town.x, WORLD_BOUNDS.town.y) < 560) {
           continue;
         }
@@ -3448,6 +3513,9 @@ export class WorldScene extends Phaser.Scene {
         const x = center.x + Math.cos(angle) * radiusX * wobble;
         const y = center.y + Math.sin(angle) * radiusY * wobble;
         const selectedTexture = Array.isArray(texture) ? texture[index % texture.length] : texture;
+        if (skipRepeatedGroundScatter(selectedTexture)) {
+          continue;
+        }
         if (this.decorationBlocked({ x, y }, selectedTexture)) {
           continue;
         }
@@ -3462,26 +3530,61 @@ export class WorldScene extends Phaser.Scene {
         });
       }
     };
+    const addBlockPerimeter = (
+      prefix: string,
+      texture: string | string[],
+      center: Vector2,
+      radiusX: number,
+      radiusY: number,
+      count: number,
+      depth: number,
+      alpha = 1,
+      baseScale = 0.74
+    ) => {
+      const slots = [
+        [-0.8, -0.66], [-0.26, -0.72], [0.34, -0.7], [0.82, -0.5],
+        [0.92, 0.05], [0.72, 0.62], [0.18, 0.72], [-0.42, 0.7], [-0.9, 0.42], [-0.94, -0.18]
+      ] as const;
+      const itemCount = Math.min(slots.length, scaleDecorationCount(count, 0.62));
+      for (let index = 0; index < itemCount; index += 1) {
+        const slot = slots[(index * 3 + count) % slots.length];
+        const x = center.x + slot[0] * radiusX;
+        const y = center.y + slot[1] * radiusY;
+        const selectedTexture = Array.isArray(texture) ? texture[index % texture.length] : texture;
+        if (this.decorationBlocked({ x, y }, selectedTexture)) {
+          continue;
+        }
+        this.decorationDefs.push({
+          id: `${prefix}-${index}`,
+          texture: selectedTexture,
+          position: { x, y },
+          scale: baseScale + ((index * 29) % 26) / 100,
+          rotation: decorationRotation(selectedTexture, ((index % 3) - 1) * 0.06, index),
+          depth,
+          alpha
+        });
+      }
+    };
 
     CITY_DEFINITIONS.forEach((city) => {
       const isHub = city.id === "greenhill";
       const ringX = city.safeRadius * (isHub ? 0.36 : 0.3);
       const ringY = city.safeRadius * (isHub ? 0.24 : 0.22);
-      addRing(`city-lamps-${city.id}`, "decor-lamp", city.position, ringX, ringY, isHub ? 8 : 3, 6.4, 0.62, isHub ? 0.62 : 0.48);
+      addBlockPerimeter(`city-lamps-${city.id}`, "decor-lamp", city.position, ringX, ringY, isHub ? 8 : 3, 6.4, 0.62, isHub ? 0.62 : 0.48);
       if (city.kind === "outpost") {
-        addRing(`safe-shrine-${city.id}`, ["decor-safe-shrine", "decor-lamp", "city-banner"], city.position, ringX * 0.78, ringY * 0.78, 3, 6.25, 0.72, 0.48);
+        addBlockPerimeter(`safe-shrine-${city.id}`, ["decor-safe-shrine", "decor-lamp", "city-banner"], city.position, ringX * 0.78, ringY * 0.78, 3, 6.25, 0.72, 0.48);
       }
       if (isHub || city.kind === "fortress") {
-        addRing(`city-banners-${city.id}`, "city-banner", city.position, ringX * 1.04, ringY * 1.04, isHub ? 4 : 2, 6.5, 0.58, isHub ? 0.54 : 0.44);
+        addBlockPerimeter(`city-banners-${city.id}`, "city-banner", city.position, ringX * 1.04, ringY * 1.04, isHub ? 4 : 2, 6.5, 0.58, isHub ? 0.54 : 0.44);
       }
       if (city.kind === "village" || city.kind === "outpost") {
-        addRing(`city-camps-${city.id}`, ["city-tent", "decor-bush", "decor-rock-flat"], city.position, ringX * 0.78, ringY * 0.72, isHub ? 0 : 3, 5.8, 0.68, 0.5);
+        addBlockPerimeter(`city-camps-${city.id}`, ["city-tent", "decor-bush", "decor-rock-flat"], city.position, ringX * 0.78, ringY * 0.72, isHub ? 0 : 3, 5.8, 0.68, 0.5);
       }
       if (city.kind === "harbor") {
-        addRing(`city-docks-${city.id}`, "city-dock", { x: city.position.x, y: city.position.y + city.safeRadius * 0.44 }, city.safeRadius * 0.24, city.safeRadius * 0.08, 2, 5.9, 0.72, 0.6);
+        addBlockPerimeter(`city-docks-${city.id}`, "city-dock", { x: city.position.x, y: city.position.y + city.safeRadius * 0.44 }, city.safeRadius * 0.24, city.safeRadius * 0.08, 2, 5.9, 0.72, 0.6);
       }
       if (city.kind === "sanctum") {
-        addRing(`city-crystals-${city.id}`, ["decor-crystal", "decor-obelisk"], city.position, ringX * 0.82, ringY * 0.82, 4, 6.1, 0.68, 0.54);
+        addBlockPerimeter(`city-crystals-${city.id}`, ["decor-crystal", "decor-obelisk"], city.position, ringX * 0.82, ringY * 0.82, 4, 6.1, 0.68, 0.54);
       }
     });
 
@@ -3577,6 +3680,9 @@ export class WorldScene extends Phaser.Scene {
         const x = Phaser.Math.Linear(segment.from.x, segment.to.x, t) + Math.cos(angle + Math.PI / 2) * offset;
         const y = Phaser.Math.Linear(segment.from.y, segment.to.y, t) + Math.sin(angle + Math.PI / 2) * offset;
         const selectedTexture = Array.isArray(texture) ? texture[index % texture.length] : texture;
+        if (skipRepeatedGroundScatter(selectedTexture)) {
+          continue;
+        }
         if (this.decorationBlocked({ x, y }, selectedTexture)) {
           continue;
         }
@@ -4125,6 +4231,7 @@ export class WorldScene extends Phaser.Scene {
 
   private updateTerrainTiles(time: number): void {
     const mobile = this.isMobileTouchMode();
+    const safariMemorySafe = this.isSafariMemorySafeMode();
     const camera = this.cameras.main;
     const zoom = camera.zoom || 1;
     const centerX = camera.scrollX + camera.width / zoom / 2;
@@ -4160,7 +4267,21 @@ export class WorldScene extends Phaser.Scene {
     this.lastTerrainUpdateAt = time;
     this.lastTerrainViewport = { x: centerX, y: centerY, zoom };
 
-    const chunk = mobile ? (fullWorldMobile ? 1024 : highFullPlusMobile ? 1152 : widePlusMobile ? 1280 : wideMobile ? 1536 : 2048) : this.desktopLeanRuntime ? 1280 : 1024;
+    const chunk = safariMemorySafe
+      ? 768
+      : mobile
+        ? fullWorldMobile
+          ? 1024
+          : highFullPlusMobile
+            ? 1152
+            : widePlusMobile
+              ? 1280
+              : wideMobile
+                ? 1536
+                : 2048
+        : this.desktopLeanRuntime
+          ? 1280
+          : 1024;
     const margin = mobile
       ? fullWorldMobile
         ? 620
@@ -4215,11 +4336,44 @@ export class WorldScene extends Phaser.Scene {
           visibleIds.add(id);
           let tile = this.terrainTiles.get(id);
           if (!tile) {
-            tile = this.add
-              .tileSprite(tileX + tileWidth / 2, tileY + tileHeight / 2, tileWidth, tileHeight, patch.texture)
-              .setDepth(patch.depth)
-              .setAlpha(patch.alpha)
-              .setTilePosition(tileX - patchLeft, tileY - patchTop);
+            if (safariMemorySafe) {
+              // Safari allocates a separate backing surface for every TileSprite. Reusing the
+              // source texture through Image keeps the new terrain art while avoiding hundreds
+              // of megabytes of per-tile GPU/Canvas memory.
+              tile = this.add
+                .image(tileX + tileWidth / 2, tileY + tileHeight / 2, patch.texture)
+                .setDepth(patch.depth)
+                .setAlpha(patch.alpha)
+                .setDisplaySize(tileWidth + 1, tileHeight + 1);
+            } else {
+              tile = this.add
+                .tileSprite(tileX + tileWidth / 2, tileY + tileHeight / 2, tileWidth, tileHeight, patch.texture)
+                .setDepth(patch.depth)
+                .setAlpha(patch.alpha)
+                .setTilePosition(tileX - patchLeft, tileY - patchTop);
+            }
+            const patchMask = patch.maskId ? this.terrainPatchMasks.get(patch.maskId) : undefined;
+            if (patchMask) {
+              tile.setMask(patchMask.mask);
+            }
+            tile.setData("terrainBaseTileX", tileX - patchLeft);
+            tile.setData("terrainBaseTileY", tileY - patchTop);
+            if (tile instanceof Phaser.GameObjects.TileSprite) {
+              if (patch.texture === WORLD_TERRAIN_SPRITE_KEYS.water) {
+                tile.setTileScale(1.36, 1.36);
+                this.animatedWaterTerrainTiles.add(tile);
+              } else if (patch.texture === WORLD_TERRAIN_SPRITE_KEYS.grass) {
+                tile.setTileScale(1.56, 1.56);
+              } else if (patch.texture === WORLD_TERRAIN_SPRITE_KEYS.swamp) {
+                tile.setTileScale(1.48, 1.48);
+              } else if (
+                patch.texture === WORLD_TERRAIN_SPRITE_KEYS.forest ||
+                patch.texture === WORLD_TERRAIN_SPRITE_KEYS.sand ||
+                patch.texture === WORLD_TERRAIN_SPRITE_KEYS.snow
+              ) {
+                tile.setTileScale(1.12, 1.12);
+              }
+            }
             this.terrainTiles.set(id, tile);
           }
         }
@@ -4228,10 +4382,117 @@ export class WorldScene extends Phaser.Scene {
 
     for (const [id, tile] of this.terrainTiles.entries()) {
       if (!visibleIds.has(id)) {
+        if (tile instanceof Phaser.GameObjects.TileSprite) {
+          this.animatedWaterTerrainTiles.delete(tile);
+        }
+        tile.clearMask(false);
         tile.destroy();
         this.terrainTiles.delete(id);
       }
     }
+  }
+
+  private createAnimatedWaterSurface(position: Vector2, width: number, height: number, depth: number, phase: number): void {
+    if (this.isSafariMemorySafeMode()) {
+      // The colored lake/river base is already drawn immediately before this call. Safari keeps
+      // that new water treatment, but skips the two large per-surface TileSprite allocations.
+      return;
+    }
+    const maskSource = this.make.graphics({ x: 0, y: 0 }, false);
+    maskSource.fillStyle(0xffffff, 1);
+    maskSource.fillEllipse(position.x, position.y, width, height);
+    const mask = maskSource.createGeometryMask();
+    const baseTileX = position.x * 0.19 + phase * 137;
+    const baseTileY = position.y * 0.13 + phase * 83;
+    const primary = this.add
+      .tileSprite(position.x, position.y, width, height, WORLD_TERRAIN_SPRITE_KEYS.water)
+      .setDepth(depth)
+      .setAlpha(0.68)
+      .setTint(0x9eeaf2)
+      .setTileScale(1.24, 1.24)
+      .setTilePosition(baseTileX, baseTileY)
+      .setMask(mask);
+    const secondary = this.add
+      .tileSprite(position.x, position.y, width, height, WORLD_TERRAIN_SPRITE_KEYS.water)
+      .setDepth(depth + 0.001)
+      .setAlpha(0.2)
+      .setTint(0xc8fbff)
+      .setTileScale(0.92, 0.92)
+      .setTilePosition(baseTileX * 0.7 + 211, baseTileY * 0.82 + 97)
+      .setMask(mask);
+    this.animatedWaterSurfaces.push({ primary, secondary, maskSource, mask, baseTileX, baseTileY, phase, position });
+  }
+
+  private updateTerrainSpriteAnimation(time: number): void {
+    const mobile = this.isMobileTouchMode();
+    const interval = mobile
+      ? this.mobileSustainedLeanRuntime || this.isMobileMinimalGraphics()
+        ? 100
+        : this.mobileLeanRuntime || this.isMobileCoolGraphics()
+          ? 50
+          : 33
+      : this.desktopLeanRuntime
+        ? 33
+        : 16;
+    if (time - this.lastTerrainSpriteAnimationAt < interval) {
+      return;
+    }
+    this.lastTerrainSpriteAnimationAt = time;
+
+    for (const tile of this.animatedWaterTerrainTiles) {
+      const baseX = Number(tile.getData("terrainBaseTileX") ?? 0);
+      const baseY = Number(tile.getData("terrainBaseTileY") ?? 0);
+      tile.setTilePosition(baseX + time * 0.009, baseY + time * 0.0045);
+    }
+
+    for (const surface of this.animatedWaterSurfaces) {
+      const visible = this.isPositionNearCamera(surface.position, 760);
+      surface.primary.setVisible(visible);
+      surface.secondary.setVisible(visible);
+      if (!visible) {
+        continue;
+      }
+      surface.primary.setTilePosition(
+        surface.baseTileX + time * (0.012 + surface.phase * 0.0008),
+        surface.baseTileY + time * (0.0045 + surface.phase * 0.0003)
+      );
+      surface.secondary.setTilePosition(
+        surface.baseTileX * 0.7 + 211 - time * (0.006 + surface.phase * 0.0004),
+        surface.baseTileY * 0.82 + 97 + time * (0.008 + surface.phase * 0.0005)
+      );
+    }
+
+    for (const route of this.animatedWaterRouteTiles) {
+      const visible = this.isPositionNearCamera({ x: route.tile.x, y: route.tile.y }, 640);
+      route.tile.setVisible(visible);
+      if (!visible) {
+        continue;
+      }
+      route.tile.setTilePosition(route.baseTileX + time * route.speed, route.baseTileY + time * 0.0038);
+    }
+  }
+
+  private destroyAnimatedTerrainSprites(): void {
+    for (const surface of this.animatedWaterSurfaces) {
+      surface.primary.clearMask(false);
+      surface.secondary.clearMask(false);
+      surface.primary.destroy();
+      surface.secondary.destroy();
+      surface.mask.destroy();
+      surface.maskSource.destroy();
+    }
+    this.animatedWaterSurfaces.length = 0;
+    for (const route of this.animatedWaterRouteTiles) {
+      route.tile.destroy();
+    }
+    this.animatedWaterRouteTiles.length = 0;
+    for (const patchMask of this.terrainPatchMasks.values()) {
+      patchMask.mask.destroy();
+      patchMask.source.destroy();
+    }
+    this.terrainPatchMasks.clear();
+    this.animatedWaterTerrainTiles.clear();
+    this.lastTerrainSpriteAnimationAt = 0;
   }
 
   private updateStaticMapGraphicsLayers(time: number, force = false): void {
@@ -4528,42 +4789,8 @@ export class WorldScene extends Phaser.Scene {
       return { fill: 0x5faa43, accent: 0xb6e36f };
     };
 
-    WORLD_MAP_REGIONS.forEach((region, index) => {
-      if (!ellipseVisible(region.position, region.width, region.height)) {
-        return;
-      }
-      const colors = biomeColor(region.kind);
-      graphics.fillStyle(colors.fill, region.kind === "coast" ? 0.15 : 0.2);
-      graphics.fillEllipse(region.position.x, region.position.y, region.width * 0.76, region.height * 0.62);
-      graphics.fillStyle(colors.accent, 0.12);
-      graphics.fillEllipse(
-        region.position.x - region.width * (0.11 - (index % 3) * 0.025),
-        region.position.y - region.height * (0.08 + (index % 2) * 0.025),
-        region.width * 0.32,
-        region.height * 0.2
-      );
-    });
-
-    WORLD_LAKES.forEach((lake) => {
-      if (!ellipseVisible(lake.position, lake.width + 260, lake.height + 160)) {
-        return;
-      }
-      graphics.fillStyle(0xd6a956, 0.2);
-      graphics.fillEllipse(lake.position.x, lake.position.y, lake.width + 210, lake.height + 132);
-      graphics.fillStyle(0x8fd4ce, 0.24);
-      graphics.fillEllipse(lake.position.x, lake.position.y, lake.width + 90, lake.height + 52);
-      graphics.fillStyle(0x54b7cf, 0.98);
-      graphics.fillEllipse(lake.position.x, lake.position.y, lake.width, lake.height);
-      graphics.fillStyle(0xc7f9ff, 0.14);
-      graphics.fillEllipse(lake.position.x - lake.width * 0.14, lake.position.y - lake.height * 0.16, lake.width * 0.42, lake.height * 0.18);
-      const waveCount = this.mobileLeanRuntime ? 1 : 2;
-      for (let wave = 0; wave < waveCount; wave += 1) {
-        const y = lake.position.y + lake.height * (-0.08 + wave * 0.16);
-        const length = lake.width * (0.34 + wave * 0.08);
-        graphics.lineStyle(2, 0xe0f7ff, 0.1);
-        graphics.lineBetween(lake.position.x - length * 0.5, y, lake.position.x + length * 0.5, y + lake.height * 0.012);
-      }
-    });
+    // drawMap() already owns the large mobile biome and lake surfaces. Redrawing them in this
+    // camera-local detail layer created the dark translucent overlaps seen on real phones.
 
     const sampleLocalRoute = (points: readonly Vector2[], steps = 5): Vector2[] => {
       if (points.length < 2) {
@@ -4647,11 +4874,22 @@ export class WorldScene extends Phaser.Scene {
           }
         }
         flush();
+        if (skipOpenWater) {
+          [points[0], points[points.length - 1]].forEach((point) => {
+            if (!ellipseVisible(point, width + 28, width + 28)) {
+              return;
+            }
+            const mouth = this.isRiverMouthWaterPosition(point, width);
+            graphics.fillStyle(mouth ? 0x0a6a78 : edge, mouth ? alpha * 0.12 : alpha * 0.34);
+            graphics.fillCircle(point.x, point.y, (width + 28) * 0.5);
+            graphics.fillStyle(mouth ? 0x168a99 : core, mouth ? alpha * 0.22 : alpha);
+            graphics.fillCircle(point.x, point.y, width * 0.5);
+          });
+        }
       });
     };
 
-    drawRoute(WORLD_RIVERS, 0x0a8eaa, 0xd6a956, 24, 0.84, true);
-    drawRoute(WORLD_ROADS, 0x8b6840, 0x2d1f14, 8, 0.7);
+    // Rivers and roads are persistent map layers too; this pass only adds sparse local texture.
     drawLocalGroundTexture();
 
     WORLD_MOUNTAINS.forEach((mountain, mountainIndex) => {
@@ -5335,17 +5573,19 @@ export class WorldScene extends Phaser.Scene {
   private drawMap(): void {
     let graphics = this.add.graphics();
     const mobile = this.isMobileTouchMode();
+    const safariMemorySafe = this.isSafariMemorySafeMode();
     const mobileFullWorldMap = mobile && this.usesMobileFullWorldMap();
     const desktopFullWorldMap = !mobile;
     const fullWorldDetailSaver = desktopFullWorldMap || mobileFullWorldMap;
     const mobileLowPowerMap = !desktopFullWorldMap && (mobile ? !mobileFullWorldMap : true);
+    const isStarterCoastalRegion = (regionId: string) => regionId === "highspring-meadow" || regionId === "elderglen-fields";
     const edgePadding = WorldScene.CAMERA_EDGE_PADDING;
     const cityVisualRadius = (city: (typeof CITY_DEFINITIONS)[number]) => {
       const scale =
         city.id === "crownspire"
-          ? 0.56
+          ? 0.46
           : city.id === "greenhill"
-            ? 0.46
+            ? 0.34
             : city.kind === "harbor"
               ? 0.56
               : city.kind === "fortress"
@@ -5380,19 +5620,120 @@ export class WorldScene extends Phaser.Scene {
                   ? "Village"
                   : "Town";
     this.terrainPatches.length = 0;
-    const addTexturedPatch = (id: string, x: number, y: number, width: number, height: number, texture: string, alpha = 0.82, depth = -9) => {
-      this.terrainPatches.push({ id, texture, x, y, width, height, alpha, depth });
+    const addTexturedPatch = (
+      id: string,
+      x: number,
+      y: number,
+      width: number,
+      height: number,
+      texture: string,
+      alpha = 0.82,
+      depth = -9,
+      maskId?: string
+    ) => {
+      this.terrainPatches.push({ id, texture, x, y, width, height, alpha, depth, maskId });
     };
-    // Keep chunked tile sprites only for the world base; biome overlays are organic paths so edges do not become rectangular seams.
-    addTexturedPatch("edge-water", WORLD_BOUNDS.width / 2, WORLD_BOUNDS.height / 2, WORLD_BOUNDS.width + edgePadding * 2, WORLD_BOUNDS.height + edgePadding * 2, "tile-water", 0.18, -10.25);
+    // All large sprite surfaces stay chunked: TileSprite allocates backing memory from its
+    // display size, so one world-sized object can exhaust Canvas memory even with a small source.
+    // The sea is already rendered by drawSmoothSea(). A second world-sized water TileSprite
+    // exposed its rectangular chunk edge in narrow previews and animated as a dark strip.
     addTexturedPatch("base-grass", WORLD_BOUNDS.width / 2, WORLD_BOUNDS.height / 2, WORLD_BOUNDS.width, WORLD_BOUNDS.height, "tile-grass", 1, -10);
+    if (!mobileLowPowerMap && !safariMemorySafe) {
+      const biomeSpriteTexture = (kind: (typeof WORLD_MAP_REGIONS)[number]["kind"]) => {
+        if (kind === "forest" || kind === "darkForest") {
+          return WORLD_TERRAIN_SPRITE_KEYS.forest;
+        }
+        if (kind === "desert" || kind === "coast") {
+          return WORLD_TERRAIN_SPRITE_KEYS.sand;
+        }
+        if (kind === "snow" || kind === "mountain") {
+          return WORLD_TERRAIN_SPRITE_KEYS.snow;
+        }
+        if (kind === "swamp") {
+          return WORLD_TERRAIN_SPRITE_KEYS.swamp;
+        }
+        if (kind === "fire") {
+          return WORLD_TERRAIN_SPRITE_KEYS.earth;
+        }
+        return kind === "grass" ? WORLD_TERRAIN_SPRITE_KEYS.grass : undefined;
+      };
+      WORLD_MAP_REGIONS.forEach((region, regionIndex) => {
+        if (isStarterCoastalRegion(region.id)) {
+          return;
+        }
+        const texture = biomeSpriteTexture(region.kind);
+        if (!texture) {
+          return;
+        }
+        const createBiomeMask = (suffix: string, scale: number) => {
+          const maskId = `biome-mask-${regionIndex}-${suffix}`;
+          const maskSource = this.make.graphics({ x: 0, y: 0 }, false);
+          const pointCount = 96;
+          maskSource.fillStyle(0xffffff, 1);
+          maskSource.beginPath();
+          for (let index = 0; index < pointCount; index += 1) {
+            const angle = (index / pointCount) * Math.PI * 2;
+            const wobble =
+              0.94 +
+              Math.sin(angle * 3 + regionIndex * 1.7) * 0.04 +
+              Math.sin(angle * 7 + regionIndex * 0.83) * 0.018 +
+              Math.sin(angle * 13 + regionIndex * 0.47) * 0.012;
+            const x = region.position.x + Math.cos(angle) * region.width * 0.49 * wobble * scale;
+            const y = region.position.y + Math.sin(angle) * region.height * 0.47 * wobble * scale;
+            if (index === 0) {
+              maskSource.moveTo(x, y);
+            } else {
+              maskSource.lineTo(x, y);
+            }
+          }
+          maskSource.closePath();
+          maskSource.fillPath();
+          const mask = maskSource.createGeometryMask();
+          this.terrainPatchMasks.set(maskId, { source: maskSource, mask });
+          return maskId;
+        };
+        const alpha =
+          region.kind === "grass"
+            ? 0.24
+            : region.kind === "desert" || region.kind === "coast"
+              ? 0.42
+              : region.kind === "forest" || region.kind === "darkForest"
+                ? 0.48
+                : 0.52;
+        const biomeSpriteLayers = safariMemorySafe
+          ? [
+              { suffix: "blend", scale: 1.04, alpha: alpha * 0.14, depth: -9.75 },
+              { suffix: "core", scale: 0.8, alpha: alpha * 0.72, depth: -9.72 }
+            ]
+          : [
+              { suffix: "outer", scale: 1.18, alpha: alpha * 0.025, depth: -9.76 },
+              { suffix: "fringe", scale: 1.09, alpha: alpha * 0.045, depth: -9.75 },
+              { suffix: "transition", scale: 1, alpha: alpha * 0.08, depth: -9.74 },
+              { suffix: "inner", scale: 0.9, alpha: alpha * 0.12, depth: -9.73 },
+              { suffix: "core", scale: 0.78, alpha: alpha * 0.32, depth: -9.72 }
+            ];
+        biomeSpriteLayers.forEach((layer) => {
+          addTexturedPatch(
+            `biome-sprite-${region.id}-${layer.suffix}`,
+            region.position.x,
+            region.position.y,
+            region.width * (safariMemorySafe ? 1.12 : 1.22),
+            region.height * (safariMemorySafe ? 1.12 : 1.22),
+            texture,
+            layer.alpha,
+            layer.depth,
+            createBiomeMask(layer.suffix, layer.scale)
+          );
+        });
+      });
+    }
     if (mobileLowPowerMap) {
       const mobileBiomePalette = (kind: (typeof WORLD_MAP_REGIONS)[number]["kind"]) => {
         if (kind === "forest") {
-          return { outer: 0x1f7438, inner: 0x42b04b, accent: 0xb7f36a };
+          return { outer: 0x64c95d, inner: 0x82e16c, accent: 0xd8ff99 };
         }
         if (kind === "darkForest") {
-          return { outer: 0x17352e, inner: 0x30523f, accent: 0x8ddf9b };
+          return { outer: 0x55b978, inner: 0x72d391, accent: 0xbfffd2 };
         }
         if (kind === "desert") {
           return { outer: 0x9c6724, inner: 0xdcaa45, accent: 0xffe08a };
@@ -5404,39 +5745,39 @@ export class WorldScene extends Phaser.Scene {
           return { outer: 0x8098a8, inner: 0xd8e7ef, accent: 0xf8fafc };
         }
         if (kind === "swamp") {
-          return { outer: 0x0f6155, inner: 0x3f9a68, accent: 0xb5f36c };
+          return { outer: 0x49bfa0, inner: 0x63d9a9, accent: 0xc8ff8e };
         }
         if (kind === "fire") {
-          return { outer: 0x642019, inner: 0xb6532d, accent: 0xffb020 };
+          return { outer: 0xc85e43, inner: 0xeb8159, accent: 0xffc766 };
         }
         if (kind === "void") {
-          return { outer: 0x2d174b, inner: 0x6d3ba8, accent: 0xd8b4fe };
+          return { outer: 0x8061bd, inner: 0xa582d7, accent: 0xeadcff };
         }
         if (kind === "mountain") {
           return { outer: 0x334155, inner: 0x94a3b8, accent: 0xe2e8f0 };
         }
-        return { outer: 0x2f7d36, inner: 0x63b64b, accent: 0xb8e866 };
+        return { outer: 0x69c75a, inner: 0x8be26b, accent: 0xdbff9b };
       };
 
       WORLD_MAP_REGIONS.forEach((region) => {
+        if (isStarterCoastalRegion(region.id)) {
+          return;
+        }
         const palette = mobileBiomePalette(region.kind);
         this.add
-          .ellipse(region.position.x, region.position.y, region.width * 1.14, region.height * 1.1, palette.outer, 0.26)
+          .ellipse(region.position.x, region.position.y, region.width * 1.18, region.height * 1.14, palette.outer, 0.1)
           .setDepth(-9.78);
         this.add
-          .ellipse(region.position.x, region.position.y, region.width * 0.94, region.height * 0.88, palette.inner, region.kind === "coast" ? 0.34 : 0.48)
+          .ellipse(region.position.x, region.position.y, region.width * 0.98, region.height * 0.92, palette.inner, region.kind === "coast" ? 0.16 : 0.24)
           .setDepth(-9.7);
         this.add
-          .ellipse(region.position.x - region.width * 0.08, region.position.y - region.height * 0.1, region.width * 0.42, region.height * 0.28, palette.accent, 0.2)
+          .ellipse(region.position.x - region.width * 0.08, region.position.y - region.height * 0.1, region.width * 0.42, region.height * 0.28, palette.accent, 0.08)
           .setDepth(-9.68);
       });
     }
-    WORLD_LANDMARKS.filter((landmark) => landmark.zone === "dungeon").forEach((landmark) => {
-      addTexturedPatch(`dungeon-floor-${landmark.id}`, landmark.position.x, landmark.position.y, landmark.radius * 2.35, landmark.radius * 1.75, "tile-dungeon", 0.12, -9.35);
-    });
-    WORLD_DUNGEON_INTERIORS.forEach((dungeon) => {
-      addTexturedPatch(`dungeon-interior-floor-${dungeon.id}`, dungeon.position.x, dungeon.position.y, dungeon.width * 1.18, dungeon.height * 1.12, "tile-dungeon", 0.58, -9.28);
-    });
+    // Dungeon interiors are painted as self-contained opaque rooms in
+    // createDungeonInteriorViews(). A rectangular terrain patch here leaked its
+    // chunk edges into the overworld and still sat behind roads and rivers.
     const drawBiome = (x: number, y: number, width: number, height: number, color: number, alpha: number, accent: number, density = 60) => {
       const pointCount = fullWorldDetailSaver ? 58 : 64;
       const organicPoints = (scale: number): Vector2[] =>
@@ -5468,26 +5809,26 @@ export class WorldScene extends Phaser.Scene {
         graphics.strokePath();
       };
       [
-        { scale: 1.34, alpha: alpha * 0.018 },
-        { scale: 1.24, alpha: alpha * 0.034 },
-        { scale: 1.14, alpha: alpha * 0.058 },
-        { scale: 1.04, alpha: alpha * 0.12 },
-        { scale: 0.96, alpha: alpha * 0.38 }
+        { scale: 1.38, alpha: alpha * 0.01 },
+        { scale: 1.28, alpha: alpha * 0.018 },
+        { scale: 1.18, alpha: alpha * 0.03 },
+        { scale: 1.08, alpha: alpha * 0.06 },
+        { scale: 0.98, alpha: alpha * 0.18 }
       ].forEach((layer) => {
         graphics.fillStyle(color, layer.alpha);
         fillOrganic(organicPoints(layer.scale));
       });
-      graphics.fillStyle(accent, alpha * 0.026);
+      graphics.fillStyle(accent, alpha * 0.012);
       fillOrganic(organicPoints(0.72));
       graphics.lineStyle(8, accent, 0.006);
       strokeOrganic(organicPoints(1.04));
-      const detailCount = fullWorldDetailSaver ? Math.min(8, Math.max(3, Math.round(density / 18))) : Math.min(22, Math.max(8, Math.round(density / 8)));
+      const detailCount = fullWorldDetailSaver ? Math.min(4, Math.max(1, Math.round(density / 36))) : Math.min(10, Math.max(3, Math.round(density / 18)));
       for (let index = 0; index < detailCount; index += 1) {
         const angle = ((index * 137.5) % 360) * Phaser.Math.DEG_TO_RAD;
         const radius = Math.sqrt(((index * 53) % 1000) / 1000);
         const px = x + Math.cos(angle) * (width * 0.46) * radius;
         const py = y + Math.sin(angle) * (height * 0.46) * radius;
-        graphics.fillStyle(index % 4 === 0 ? accent : color, index % 4 === 0 ? 0.14 : 0.09);
+        graphics.fillStyle(index % 4 === 0 ? accent : color, index % 4 === 0 ? 0.07 : 0.045);
         graphics.fillEllipse(px, py, 36 + (index % 5) * 12, 16 + (index % 4) * 7);
       }
     };
@@ -5540,22 +5881,6 @@ export class WorldScene extends Phaser.Scene {
       points.slice(1).forEach((point) => graphics.lineTo(point.x, point.y));
       graphics.strokePath();
     };
-    const strokeOffsetPolyline = (points: Vector2[], offset: number) => {
-      graphics.beginPath();
-      points.forEach((point, index) => {
-        const previous = points[Math.max(0, index - 1)];
-        const next = points[Math.min(points.length - 1, index + 1)];
-        const angle = Math.atan2(next.y - previous.y, next.x - previous.x);
-        const x = point.x - Math.sin(angle) * offset;
-        const y = point.y + Math.cos(angle) * offset;
-        if (index === 0) {
-          graphics.moveTo(x, y);
-          return;
-        }
-        graphics.lineTo(x, y);
-      });
-      graphics.strokePath();
-    };
     const roadNoise = (seed: number) => {
       const value = Math.sin(seed * 12.9898) * 43758.5453;
       return value - Math.floor(value);
@@ -5570,6 +5895,9 @@ export class WorldScene extends Phaser.Scene {
         target.moveTo(points[0].x, points[0].y);
         points.slice(1).forEach((point) => target.lineTo(point.x, point.y));
         target.strokePath();
+        target.fillStyle(color, alphaValue);
+        target.fillCircle(points[0].x, points[0].y, width * 0.5);
+        target.fillCircle(points[points.length - 1].x, points[points.length - 1].y, width * 0.5);
       };
       const addWaterRouteLayer = (color: number, alpha: number, widthBoost: number, depth: number) => {
         const routeGraphics = this.add.graphics().setDepth(depth);
@@ -5577,30 +5905,27 @@ export class WorldScene extends Phaser.Scene {
           const routeWidth = (route.width ?? 60) + widthBoost;
           const points = sampleCurve([...route.points], 8);
           const run: Vector2[] = [];
-          let runMouth = false;
           const flush = () => {
-            const runColor = runMouth ? (color === 0x0a8eaa ? 0x168a99 : 0x0a6170) : color;
-            const runAlpha = runMouth ? alpha * (color === 0x0a8eaa ? 0.22 : 0.14) : alpha;
-            strokeLowPowerRun(routeGraphics, run, routeWidth, runColor, runAlpha);
+            strokeLowPowerRun(routeGraphics, run, routeWidth, color, alpha);
             run.length = 0;
           };
 
           for (let index = 0; index < points.length - 1; index += 1) {
             const start = points[index];
             const end = points[index + 1];
-            const midpoint = { x: (start.x + end.x) / 2, y: (start.y + end.y) / 2 };
-            const mouth =
-              this.isRiverMouthWaterPosition(midpoint, routeWidth) ||
-              this.isRiverMouthWaterPosition(start, routeWidth) ||
-              this.isRiverMouthWaterPosition(end, routeWidth);
-            if (run.length > 0 && mouth !== runMouth) {
+            const startInWater = this.isVisualOpenWaterPosition(start);
+            const endInWater = this.isVisualOpenWaterPosition(end);
+            if (startInWater && endInWater) {
               flush();
+              continue;
             }
             if (run.length === 0) {
-              runMouth = mouth;
               run.push(start);
             }
             run.push(end);
+            if (startInWater || endInWater) {
+              flush();
+            }
           }
           flush();
         });
@@ -5647,14 +5972,14 @@ export class WorldScene extends Phaser.Scene {
         });
       };
 
-      addWaterRouteLayer(0x083d56, 0.24, 58, -9.22);
-      addWaterRouteLayer(0x0a8eaa, 0.78, 28, -9.18);
-      addRouteSegments(WORLD_ROADS, 0x3f2d1c, 0.24, 30, -8.96);
-      addRouteSegments(WORLD_ROADS, 0x8b6840, 0.66, 10, -8.92);
+      addWaterRouteLayer(WORLD_WATER_EDGE_COLOR, 0.06, 34, -9.22);
+      addWaterRouteLayer(WORLD_WATER_CORE_COLOR, 0.98, 18, -9.18);
+      addRouteSegments(WORLD_ROADS, 0xc68a4d, 0.22, 24, -8.96);
+      addRouteSegments(WORLD_ROADS, 0xf0b66d, 0.76, 8, -8.92);
       WORLD_LAKES.forEach((lake) => {
-        this.add.ellipse(lake.position.x, lake.position.y, lake.width + 180, lake.height + 116, 0xd6a956, 0.14).setDepth(-9.25);
-        this.add.ellipse(lake.position.x, lake.position.y, lake.width + 78, lake.height + 46, 0x8fd4ce, 0.2).setDepth(-9.23);
-        this.add.ellipse(lake.position.x, lake.position.y, lake.width, lake.height, 0x54b7cf, 0.98).setDepth(-9.2);
+        this.add.ellipse(lake.position.x, lake.position.y, lake.width + 48, lake.height + 30, WORLD_WATER_EDGE_COLOR, 0.06).setDepth(-9.23);
+        this.add.ellipse(lake.position.x, lake.position.y, lake.width, lake.height, WORLD_WATER_CORE_COLOR, 0.98).setDepth(-9.2);
+        this.createAnimatedWaterSurface(lake.position, lake.width, lake.height, -9.19, WORLD_LAKES.indexOf(lake) + 1);
         this.add.ellipse(lake.position.x - lake.width * 0.14, lake.position.y - lake.height * 0.14, lake.width * 0.46, lake.height * 0.22, 0xbdeefa, 0.16).setDepth(-9.19);
         for (let wave = 0; wave < 2; wave += 1) {
           this.add
@@ -5670,31 +5995,32 @@ export class WorldScene extends Phaser.Scene {
         const townRadius = cityVisualRadius(city);
         const palette =
           city.kind === "harbor"
-            ? { ground: 0x263c42, street: 0x8b6840, wall: 0x38bdf8, roof: 0x475569, label: "#bae6fd" }
+            ? { ground: 0x70c3bd, street: 0xf0b875, wall: 0xb9f4f1, roof: 0x6f8fa0, label: "#efffff" }
             : city.kind === "capital"
-              ? { ground: 0x2f3f2f, street: 0x8a6a3d, wall: 0xfacc15, roof: 0x64748b, label: "#fef3c7" }
+              ? { ground: 0x62c66c, street: 0xf1bd79, wall: 0xc5f5b8, roof: 0x758fa0, label: "#f3fff0" }
             : city.kind === "fortress"
-              ? { ground: 0x2d3340, street: 0x6b5a44, wall: 0xcbd5e1, roof: 0x64748b, label: "#dbeafe" }
+              ? { ground: 0x8fb4bd, street: 0xe2c091, wall: 0xdff4f8, roof: 0x758fa0, label: "#f4fdff" }
               : city.kind === "sanctum"
-                ? { ground: 0x28223f, street: 0x594b7c, wall: 0xa78bfa, roof: 0x6d5d9c, label: "#ddd6fe" }
+                ? { ground: 0xaa92d1, street: 0xe0c2dc, wall: 0xe9ddff, roof: 0x927db4, label: "#fff7ff" }
                 : city.kind === "outpost"
-                  ? { ground: 0x322719, street: 0x7a4f2a, wall: 0xfbbf24, roof: 0x7c4a25, label: "#fef3c7" }
-                  : { ground: 0x263927, street: 0x70502f, wall: 0x86efac, roof: 0x64748b, label: "#dcfce7" };
-        this.add.ellipse(city.position.x, city.position.y, townRadius * 2.42, townRadius * 1.58, palette.ground, isHub ? 0.8 : 0.7).setDepth(-8.72);
-        this.add.ellipse(city.position.x, city.position.y, townRadius * 2.66, townRadius * 1.78, palette.wall, 0.13).setDepth(-8.74);
-        this.add.rectangle(city.position.x, city.position.y, townRadius * 2.08, 36, palette.street, 0.62).setDepth(-8.68);
-        this.add.rectangle(city.position.x, city.position.y, 36, townRadius * 1.34, palette.street, 0.48).setDepth(-8.67);
-        this.add.rectangle(city.position.x, city.position.y - townRadius * 0.28, townRadius * 1.42, 14, palette.street, 0.32).setDepth(-8.665);
-        this.add.rectangle(city.position.x, city.position.y + townRadius * 0.28, townRadius * 1.42, 14, palette.street, 0.32).setDepth(-8.665);
+                  ? { ground: 0xb89b68, street: 0xf0b86e, wall: 0xf6dda7, roof: 0xa36f43, label: "#fff8df" }
+                  : { ground: 0x6abd70, street: 0xedb875, wall: 0xc7f4c7, roof: 0x758f96, label: "#effff1" };
+        // Keep optimized-mobile towns readable through their houses/services only. The two old
+        // full-size translucent rectangles looked like a second biome or a giant shadow.
         const mobileHouseCount =
           isGrandCapital ? 14 : isHub ? 12 : city.kind === "harbor" || city.kind === "fortress" || city.kind === "village" ? 7 : 5;
+        const mobileBlockSlots = [
+          [-0.72, -0.42], [-0.42, -0.46], [0.34, -0.46], [0.7, -0.36],
+          [-0.72, 0.04], [0.58, 0.02], [-0.58, 0.36], [-0.26, 0.42], [0.3, 0.4], [0.66, 0.34],
+          [-0.88, -0.18], [0.86, 0.18], [-0.04, -0.48], [0.06, 0.44]
+        ] as const;
         for (let index = 0; index < mobileHouseCount; index += 1) {
-          const angle = (index / mobileHouseCount) * Math.PI * 2;
-          const x = city.position.x + Math.cos(angle) * townRadius * 0.67;
-          const y = city.position.y + Math.sin(angle) * townRadius * 0.43;
+          const slot = mobileBlockSlots[(index + city.recommendedLevel) % mobileBlockSlots.length];
+          const x = city.position.x + slot[0] * townRadius;
+          const y = city.position.y + slot[1] * townRadius;
           this.add
             .rectangle(x, y, isMajorCapital ? 62 : 50, isMajorCapital ? 40 : 32, palette.roof, 0.78)
-            .setRotation(angle * 0.18)
+            .setRotation(((index % 3) - 1) * 0.04)
             .setDepth(-8.62);
         }
         this.add
@@ -5709,57 +6035,20 @@ export class WorldScene extends Phaser.Scene {
           .setAlpha(isMajorCapital ? 0.78 : 0.62)
           .setDepth(-8.5);
       });
-      this.add
-        .circle(WORLD_STARTER_ARENA.center.x, WORLD_STARTER_ARENA.center.y, WORLD_STARTER_ARENA_WALL_RADIUS, 0x250f10, 0.08)
-        .setStrokeStyle(18, 0x7f1d1d, 0.42)
-        .setDepth(-8.8);
-      this.add
-        .circle(WORLD_STARTER_ARENA.center.x, WORLD_STARTER_ARENA.center.y, WORLD_STARTER_ARENA.innerRadius, 0x12080a, 0.08)
-        .setStrokeStyle(4, 0xf97316, 0.28)
-        .setDepth(-8.79);
       const arena = WORLD_STARTER_ARENA;
       const arenaCenter = arena.center;
-      this.add.circle(arenaCenter.x, arenaCenter.y, WORLD_STARTER_ARENA_WALL_RADIUS + 88, 0x160607, 0.24).setDepth(-8.84);
       this.add
-        .circle(arenaCenter.x, arenaCenter.y, WORLD_STARTER_ARENA_WALL_RADIUS, 0x2a0c0e, 0.44)
-        .setStrokeStyle(28, 0x7f1d1d, 0.64)
+        .circle(arenaCenter.x, arenaCenter.y, WORLD_STARTER_ARENA_WALL_RADIUS, 0x8b6848, 0.2)
+        .setStrokeStyle(18, 0x70442c, 0.68)
         .setDepth(-8.83);
       this.add
-        .circle(arenaCenter.x, arenaCenter.y, arena.radius + 80, 0x451318, 0.5)
-        .setStrokeStyle(12, 0xf97316, 0.28)
+        .circle(arenaCenter.x, arenaCenter.y, arena.radius, 0xbc7046, 1)
+        .setStrokeStyle(10, 0xe4aa6b, 0.34)
         .setDepth(-8.82);
       this.add
-        .circle(arenaCenter.x, arenaCenter.y, arena.innerRadius, 0x15080a, 0.66)
-        .setStrokeStyle(6, 0xf97316, 0.42)
+        .circle(arenaCenter.x, arenaCenter.y, arena.innerRadius, 0xd58a57, 0.96)
+        .setStrokeStyle(5, 0xf3c17d, 0.42)
         .setDepth(-8.81);
-      WORLD_STARTER_ARENA_GATES.forEach((gate) => {
-        const gateX = arenaCenter.x + Math.cos(gate.angle) * (arena.radius + 240);
-        const gateY = arenaCenter.y + Math.sin(gate.angle) * (arena.radius + 240);
-        this.add
-          .rectangle(gateX, gateY, 520, 128, 0x8b6840, 0.72)
-          .setRotation(gate.angle)
-          .setDepth(-8.795);
-        this.add
-          .rectangle(gateX, gateY, 520, 32, 0xd6a15d, 0.2)
-          .setRotation(gate.angle)
-          .setDepth(-8.794);
-      });
-      for (let index = 0; index < 18; index += 1) {
-        const angle = (index / 18) * Math.PI * 2;
-        const middle = (arena.innerRadius + arena.radius) * 0.5;
-        this.add
-          .rectangle(arenaCenter.x + Math.cos(angle) * middle, arenaCenter.y + Math.sin(angle) * middle, arena.radius - arena.innerRadius + 96, 6, 0xf97316, index % 3 === 0 ? 0.22 : 0.12)
-          .setRotation(angle)
-          .setDepth(-8.79);
-      }
-      for (let index = 0; index < 28; index += 1) {
-        const angle = (index / 28) * Math.PI * 2;
-        const radius = arena.radius + 104 + (index % 2) * 34;
-        this.add
-          .rectangle(arenaCenter.x + Math.cos(angle) * radius, arenaCenter.y + Math.sin(angle) * radius, 58, 28, index % 2 === 0 ? 0x6b2319 : 0x3f1c14, 0.72)
-          .setRotation(angle + 0.28)
-          .setDepth(-8.785);
-      }
       this.add
         .text(arenaCenter.x, arenaCenter.y - arena.radius - 72, this.tr("ARENA"), {
           color: "#fed7aa",
@@ -5816,45 +6105,46 @@ export class WorldScene extends Phaser.Scene {
       const samples = sampleCurve(points, fullWorldDetailSaver ? 16 : 28);
       waterRoutes.push({ samples, width });
       const waterLayers = [
-        { width: width + 92, color: 0xd6b15d, alpha: 0.055 },
-        { width: width + 54, color: 0x6fbf86, alpha: 0.06 },
-        { width: width + 24, color: 0x0a8eaa, alpha: 0.84 }
+        { width: width + 34, color: WORLD_WATER_EDGE_COLOR, alpha: 0.06 },
+        { width: width + 18, color: WORLD_WATER_CORE_COLOR, alpha: 0.98 }
       ];
-      const strokeWaterRun = (points: Vector2[], layer: (typeof waterLayers)[number], mouth: boolean) => {
+      const strokeWaterRun = (points: Vector2[], layer: (typeof waterLayers)[number]) => {
         if (points.length < 2) {
           return;
         }
-        const layerColor = mouth ? (layer.color === 0x0a8eaa ? 0x168a99 : 0x0a6170) : layer.color;
-        const layerAlpha = mouth ? layer.alpha * (layer.color === 0x0a8eaa ? 0.24 : 0.2) : layer.alpha;
-        graphics.lineStyle(layer.width, layerColor, layerAlpha);
+        graphics.lineStyle(layer.width, layer.color, layer.alpha);
         graphics.beginPath();
         graphics.moveTo(points[0].x, points[0].y);
         points.slice(1).forEach((point) => graphics.lineTo(point.x, point.y));
         graphics.strokePath();
+        graphics.fillStyle(layer.color, layer.alpha);
+        graphics.fillCircle(points[0].x, points[0].y, layer.width * 0.5);
+        graphics.fillCircle(points[points.length - 1].x, points[points.length - 1].y, layer.width * 0.5);
       };
       waterLayers.forEach((layer) => {
         const run: Vector2[] = [];
-        let runMouth = false;
         const flush = () => {
-          strokeWaterRun(run, layer, runMouth);
+          strokeWaterRun(run, layer);
           run.length = 0;
         };
         for (let index = 0; index < samples.length - 1; index += 1) {
           const start = samples[index];
           const end = samples[index + 1];
-          const midpoint = { x: (start.x + end.x) / 2, y: (start.y + end.y) / 2 };
-          const mouth =
-            this.isRiverMouthWaterPosition(midpoint, width) ||
-            this.isRiverMouthWaterPosition(start, width) ||
-            this.isRiverMouthWaterPosition(end, width);
-          if (run.length > 0 && mouth !== runMouth) {
+          const startInWater = this.isVisualOpenWaterPosition(start);
+          const endInWater = this.isVisualOpenWaterPosition(end);
+          if (startInWater && endInWater) {
             flush();
+            continue;
           }
+          // Keep the last crossing segment. Dropping a whole segment as soon as
+          // one endpoint touched the lake/sea left a visible grass-colored gap.
           if (run.length === 0) {
-            runMouth = mouth;
             run.push(start);
           }
           run.push(end);
+          if (startInWater || endInWater) {
+            flush();
+          }
         }
         flush();
       });
@@ -5979,15 +6269,17 @@ export class WorldScene extends Phaser.Scene {
     };
     const drawRoadNetwork = (
       routes: Array<{ id: string; samples: Vector2[]; width: number; fill: number; shoulder: number; edge: number; patch: number; mark: number; stone: number; mode: "cobble" | "sand" | "dirt" | "snow" | "void" | "ash" | "forest" }>,
-      routeIndexOffset = 0
+      _routeIndexOffset = 0
     ) => {
-      routes.forEach((road, localRouteIndex) => {
-        const routeIndex = routeIndexOffset + localRouteIndex;
+      routes.forEach((road) => {
         [
-          { width: road.width + 44, color: 0x15100a, alpha: 0.2, joints: false },
-          { width: road.width + 30, color: road.edge, alpha: 0.38, joints: false },
-          { width: road.width + 16, color: road.shoulder, alpha: 0.72, joints: false },
-          { width: road.width, color: road.fill, alpha: 1, joints: true }
+          { width: road.width + 18, color: 0x9b7b52, alpha: 0.07, joints: false },
+          { width: road.width + 8, color: road.shoulder, alpha: 0.25, joints: false },
+          { width: road.width, color: road.fill, alpha: 0.86, joints: true },
+          // Keep the road lightly textured as one continuous cartoon stroke. The old
+          // translucent TileSprite pieces overlapped at every segment boundary and made
+          // bright bars across the road, especially on diagonal routes.
+          { width: road.width * 0.72, color: road.patch, alpha: 0.1, joints: true }
         ].forEach((layer) => {
           graphics.lineStyle(layer.width, layer.color, layer.alpha);
           strokePolyline(road.samples);
@@ -6010,83 +6302,6 @@ export class WorldScene extends Phaser.Scene {
           }
         });
 
-        const roadPatchStep = fullWorldDetailSaver ? 6 : 3;
-        for (let index = 2; index < road.samples.length - 2; index += roadPatchStep) {
-          const point = road.samples[index];
-          const previous = road.samples[index - 1];
-          const next = road.samples[index + 1];
-          const angle = Math.atan2(next.y - previous.y, next.x - previous.x);
-          const normalX = -Math.sin(angle);
-          const normalY = Math.cos(angle);
-          const noise = roadNoise(routeIndex * 211 + index * 17);
-          const offset = (noise - 0.5) * road.width * 0.56;
-          const stoneLike = road.mode === "cobble" || road.mode === "snow";
-          graphics.fillStyle(index % 4 === 0 ? road.stone : road.patch, stoneLike ? 0.42 + noise * 0.2 : 0.12 + noise * 0.12);
-          graphics.fillEllipse(
-            point.x + normalX * offset,
-            point.y + normalY * offset,
-            stoneLike ? 22 + noise * 34 : 14 + noise * 26,
-            stoneLike ? 13 + noise * 18 : 7 + noise * 13
-          );
-          if (stoneLike) {
-            graphics.lineStyle(2, 0xffffff, 0.14);
-            graphics.strokeEllipse(point.x + normalX * offset - 2, point.y + normalY * offset - 2, 14 + noise * 24, 7 + noise * 12);
-          }
-        }
-
-        const roadEdgeStep = fullWorldDetailSaver ? 10 : 5;
-        for (let index = 3; index < road.samples.length - 3; index += roadEdgeStep) {
-          const point = road.samples[index];
-          const previous = road.samples[index - 1];
-          const next = road.samples[index + 1];
-          const angle = Math.atan2(next.y - previous.y, next.x - previous.x);
-          const normalX = -Math.sin(angle);
-          const normalY = Math.cos(angle);
-          [-1, 1].forEach((side) => {
-            const noise = roadNoise(routeIndex * 97 + index * 13 + side * 19);
-            const distance = side * (road.width * 0.46 + 7 + noise * 14);
-            graphics.fillStyle(road.patch, 0.12 + noise * 0.09);
-            graphics.fillEllipse(point.x + normalX * distance, point.y + normalY * distance, 22 + noise * 34, 10 + noise * 18);
-          });
-        }
-
-        graphics.lineStyle(2, road.mark, 0.1);
-        strokeOffsetPolyline(road.samples, road.width * 0.18);
-        strokeOffsetPolyline(road.samples, -road.width * 0.18);
-        graphics.lineStyle(1, road.mark, 0.08);
-        strokeOffsetPolyline(road.samples, 0);
-        if (road.mode === "sand" || road.mode === "ash" || road.mode === "forest") {
-          graphics.lineStyle(2, road.mark, 0.1);
-          for (let index = 4; index < road.samples.length - 4; index += 9) {
-            const point = road.samples[index];
-            const previous = road.samples[index - 1];
-            const next = road.samples[index + 1];
-            const angle = Math.atan2(next.y - previous.y, next.x - previous.x);
-            const tangentX = Math.cos(angle);
-            const tangentY = Math.sin(angle);
-            graphics.lineBetween(point.x - tangentX * 18, point.y - tangentY * 18, point.x + tangentX * 18, point.y + tangentY * 18);
-          }
-        }
-        if (road.mode === "void" || road.mode === "ash") {
-          graphics.lineStyle(3, road.mark, 0.12);
-          strokeOffsetPolyline(road.samples, road.width * 0.31);
-          strokeOffsetPolyline(road.samples, -road.width * 0.31);
-          const ornamentStep = fullWorldDetailSaver ? 18 : 13;
-          for (let index = 6; index < road.samples.length - 6; index += ornamentStep) {
-            const point = road.samples[index];
-            const previous = road.samples[index - 1];
-            const next = road.samples[index + 1];
-            const angle = Math.atan2(next.y - previous.y, next.x - previous.x);
-            const normalX = -Math.sin(angle);
-            const normalY = Math.cos(angle);
-            const noise = roadNoise(routeIndex * 313 + index * 29);
-            const centerX = point.x + Math.cos(angle) * ((noise - 0.5) * 12);
-            const centerY = point.y + Math.sin(angle) * ((noise - 0.5) * 12);
-            graphics.lineStyle(2, road.mark, 0.18 + noise * 0.14);
-            graphics.strokeCircle(centerX, centerY, 9 + noise * 9);
-            graphics.lineBetween(centerX - normalX * 9, centerY - normalY * 9, centerX + normalX * 9, centerY + normalY * 9);
-          }
-        }
       });
     };
     const drawBridge = (x: number, y: number, rotation: number, length = 420, width = 96) => {
@@ -6144,28 +6359,28 @@ export class WorldScene extends Phaser.Scene {
       const isTradeZone = city.id === "market";
       const theme =
         isTradeZone
-          ? { ground: 0x183528, street: 0x80642a, edge: 0x22c55e, wall: 0x64748b, label: "#bbf7d0" }
+          ? { ground: 0x62be6b, street: 0xf0ba70, edge: 0xa7f3b0, wall: 0xa3b8b1, label: "#effff1" }
           : city.kind === "harbor"
-          ? { ground: 0x263c42, street: 0x7a5a36, edge: 0x38bdf8, wall: 0x475569, label: "#bae6fd" }
+          ? { ground: 0x70c3bd, street: 0xf0b875, edge: 0xb9f4f1, wall: 0x8fa9aa, label: "#efffff" }
           : city.kind === "capital"
-            ? { ground: 0x2f3f2f, street: 0x8a6a3d, edge: 0xfacc15, wall: 0x94a3b8, label: "#fef3c7" }
+            ? { ground: 0x62c66c, street: 0xf1bd79, edge: 0xc5f5b8, wall: 0x9eb8aa, label: "#f3fff0" }
           : city.kind === "fortress"
-            ? { ground: 0x2d3340, street: 0x6b5a44, edge: 0xcbd5e1, wall: 0x64748b, label: "#dbeafe" }
+            ? { ground: 0x8fb4bd, street: 0xe2c091, edge: 0xdff4f8, wall: 0x91a9b0, label: "#f4fdff" }
             : city.kind === "sanctum"
-              ? { ground: 0x28223f, street: 0x594b7c, edge: 0xa78bfa, wall: 0x6d5d9c, label: "#ddd6fe" }
+              ? { ground: 0xaa92d1, street: 0xe0c2dc, edge: 0xe9ddff, wall: 0xa58fc2, label: "#fff7ff" }
               : city.kind === "outpost"
-                ? { ground: 0x322719, street: 0x7a4f2a, edge: 0xfbbf24, wall: 0x7c4a25, label: "#fef3c7" }
-                : { ground: 0x263927, street: 0x70502f, edge: 0x86efac, wall: 0x64748b, label: "#dcfce7" };
-      graphics.lineStyle(2, theme.edge, isMajorCapital ? 0.075 : 0.045);
-      graphics.strokeCircle(city.position.x, city.position.y, city.safeRadius);
-
+                ? { ground: 0xb89b68, street: 0xf0b86e, edge: 0xf6dda7, wall: 0xa77b4f, label: "#fff8df" }
+                : { ground: 0x6abd70, street: 0xedb875, edge: 0xc7f4c7, wall: 0x9bacaa, label: "#effff1" };
       const townRadius = cityVisualRadius(city);
-      const footprint = Array.from({ length: 36 }, (_, index) => {
-        const angle = (index / 36) * Math.PI * 2;
-        const wobble = 0.9 + Math.sin(angle * 3 + city.recommendedLevel) * 0.05 + Math.sin(angle * 7 + city.recommendedLevel * 1.7) * 0.028;
+      const footprintShape = [
+        [-0.98, -0.32], [-0.82, -0.66], [-0.34, -0.75], [0.08, -0.68], [0.58, -0.73], [0.94, -0.46],
+        [1.02, -0.08], [0.9, 0.34], [0.62, 0.62], [0.18, 0.68], [-0.24, 0.62], [-0.68, 0.67], [-1, 0.4], [-0.94, 0.04]
+      ] as const;
+      const footprint = footprintShape.map(([nx, ny], index) => {
+        const wobble = 1 + Math.sin(index * 2.7 + city.recommendedLevel) * 0.025;
         return {
-          x: city.position.x + Math.cos(angle) * townRadius * (isMajorCapital ? 1.2 : 1.02) * wobble,
-          y: city.position.y + Math.sin(angle) * townRadius * (isMajorCapital ? 0.78 : 0.76) * wobble
+          x: city.position.x + nx * townRadius * (isMajorCapital ? 1.2 : 1.02) * wobble,
+          y: city.position.y + ny * townRadius * wobble
         };
       });
       const fillFootprint = (points: Vector2[]) => {
@@ -6183,67 +6398,77 @@ export class WorldScene extends Phaser.Scene {
         graphics.strokePath();
       };
 
-      graphics.fillStyle(0x3a2417, isMajorCapital ? 0.055 : 0.075);
-      graphics.fillEllipse(city.position.x + townRadius * 0.04, city.position.y + townRadius * 0.12, townRadius * 2.34, townRadius * 1.58);
-      graphics.fillStyle(theme.ground, isMajorCapital ? 0.74 : 0.7);
-      fillFootprint(footprint);
-      graphics.lineStyle(isMajorCapital ? 15 : 11, theme.edge, isMajorCapital ? 0.16 : 0.15);
-      strokeFootprint(footprint);
+      graphics.fillStyle(0x8d714a, isMajorCapital ? 0.035 : 0.05);
+      graphics.fillRoundedRect(
+        city.position.x - townRadius * 1.08,
+        city.position.y - townRadius * 0.62,
+        townRadius * 2.2,
+        townRadius * 1.34,
+        Math.max(34, townRadius * 0.12)
+      );
+      // Keep the coastal capital silhouette on land. Its old safe-zone polygon
+      // extended past the shore and looked like a translucent city floating at sea.
+      if (isHub) {
+        const hubFootprint = footprint.filter((point) => !this.isVisualOpenWaterPosition(point));
+        if (hubFootprint.length >= 3) {
+          graphics.fillStyle(theme.ground, 0.48);
+          fillFootprint(hubFootprint);
+          graphics.lineStyle(15, theme.edge, 0.16);
+          strokeFootprint(hubFootprint);
+        }
+      } else {
+        graphics.fillStyle(theme.ground, isMajorCapital ? 0.48 : 0.54);
+        fillFootprint(footprint);
+        graphics.lineStyle(isMajorCapital ? 15 : 11, theme.edge, isMajorCapital ? 0.16 : 0.15);
+        strokeFootprint(footprint);
+      }
 
-      graphics.lineStyle(isMajorCapital ? 54 : 34, 0x1f160e, isMajorCapital ? 0.16 : 0.12);
-      graphics.lineBetween(city.position.x - townRadius * 1.02, city.position.y, city.position.x + townRadius * 1.02, city.position.y);
-      graphics.lineBetween(city.position.x, city.position.y - townRadius * 0.72, city.position.x, city.position.y + townRadius * 0.72);
-      graphics.lineStyle(isMajorCapital ? 40 : 26, theme.street, isMajorCapital ? 0.58 : 0.48);
-      graphics.lineBetween(city.position.x - townRadius * 0.96, city.position.y, city.position.x + townRadius * 0.96, city.position.y);
-      graphics.lineBetween(city.position.x, city.position.y - townRadius * 0.66, city.position.x, city.position.y + townRadius * 0.66);
-      graphics.lineStyle(isMajorCapital ? 22 : 16, 0x1f160e, 0.11);
-      [-0.3, 0.3].forEach((offset) => {
-        graphics.lineBetween(
-          city.position.x - townRadius * 0.7,
-          city.position.y + townRadius * offset,
-          city.position.x + townRadius * 0.7,
-          city.position.y + townRadius * offset
-        );
-      });
-      graphics.lineStyle(isMajorCapital ? 15 : 11, theme.street, 0.34);
-      [-0.3, 0.3].forEach((offset) => {
-        graphics.lineBetween(
-          city.position.x - townRadius * 0.68,
-          city.position.y + townRadius * offset,
-          city.position.x + townRadius * 0.68,
-          city.position.y + townRadius * offset
-        );
-      });
-      graphics.lineStyle(5, theme.edge, 0.15);
-      graphics.strokeEllipse(city.position.x, city.position.y, townRadius * 1.82, townRadius * 1.12);
-      graphics.lineStyle(2, 0xfde68a, 0.11);
-      graphics.strokeEllipse(city.position.x, city.position.y, townRadius * 1.42, townRadius * 0.82);
       if (isTradeZone) {
-        graphics.fillStyle(0x22c55e, 0.035);
-        graphics.fillCircle(city.position.x, city.position.y, city.safeRadius * 0.86);
-        graphics.lineStyle(12, 0x22c55e, 0.2);
-        graphics.strokeCircle(city.position.x, city.position.y, city.safeRadius * 0.96);
-        graphics.lineStyle(5, 0xfacc15, 0.24);
-        graphics.strokeCircle(city.position.x, city.position.y, city.safeRadius * 0.58);
+        graphics.fillStyle(0x22c55e, 0.08);
+        graphics.fillRoundedRect(
+          city.position.x - townRadius * 0.72,
+          city.position.y - townRadius * 0.5,
+          townRadius * 1.44,
+          townRadius * 0.96,
+          42
+        );
+        graphics.lineStyle(8, 0x22c55e, 0.22);
+        graphics.strokeRoundedRect(
+          city.position.x - townRadius * 0.72,
+          city.position.y - townRadius * 0.5,
+          townRadius * 1.44,
+          townRadius * 0.96,
+          42
+        );
       }
 
       const fortified = isGrandCapital || city.kind === "fortress" || city.kind === "sanctum";
       if (fortified) {
-        const wallCount = isGrandCapital ? 12 : city.kind === "fortress" ? 8 : 6;
-        for (let index = 0; index < wallCount; index += 1) {
-          const angle = (index / wallCount) * Math.PI * 2;
-          const px = city.position.x + Math.cos(angle) * townRadius * (isMajorCapital ? 1.14 : 1.03);
-          const py = city.position.y + Math.sin(angle) * townRadius * (isMajorCapital ? 0.76 : 0.7);
+        const horizontalSlots = isGrandCapital ? [-0.72, -0.36, 0, 0.36, 0.72] : [-0.56, 0, 0.56];
+        const verticalSlots = isGrandCapital ? [-0.36, 0.08, 0.42] : [-0.28, 0.3];
+        const wallSlots = [
+          ...horizontalSlots.flatMap((nx) => [
+            { nx, ny: -0.69, rotation: 0 },
+            { nx, ny: 0.66, rotation: Math.PI }
+          ]),
+          ...verticalSlots.flatMap((ny) => [
+            { nx: -1.05, ny, rotation: -Math.PI / 2 },
+            { nx: 1.05, ny, rotation: Math.PI / 2 }
+          ])
+        ];
+        wallSlots.forEach((slot, index) => {
+          const px = city.position.x + slot.nx * townRadius;
+          const py = city.position.y + slot.ny * townRadius;
           this.add
             .image(px, py, "city-wall")
-            .setRotation(angle + Math.PI / 2)
+            .setRotation(slot.rotation)
             .setScale(0.68, 0.58)
             .setTint(theme.wall)
-            .setDepth(5.35);
-        }
+            .setDepth(5.35 + index * 0.0001);
+        });
         const gatePositions = [
-          { dx: 0, dy: -townRadius * 0.72, rotation: 0 },
-          { dx: 0, dy: townRadius * 0.72, rotation: Math.PI }
+          { dx: -townRadius * 0.18, dy: -townRadius * 0.7, rotation: 0 },
+          { dx: townRadius * 0.16, dy: townRadius * 0.68, rotation: Math.PI }
         ];
         gatePositions.forEach((gate, index) => {
           this.add
@@ -6274,12 +6499,18 @@ export class WorldScene extends Phaser.Scene {
                 : city.kind === "sanctum"
                   ? 7
                   : 5;
+      const blockSlots = [
+        [-0.78, -0.46], [-0.52, -0.5], [0.3, -0.5], [0.62, -0.46], [0.82, -0.28],
+        [-0.8, -0.12], [-0.5, -0.16], [0.48, -0.18], [0.76, 0.02],
+        [-0.72, 0.24], [-0.42, 0.3], [0.34, 0.24], [0.68, 0.3],
+        [-0.66, 0.5], [-0.3, 0.48], [0.28, 0.5], [0.58, 0.48]
+      ] as const;
       for (let index = 0; index < houseCount; index += 1) {
-        const angle = (index / houseCount) * Math.PI * 2 + (index % 2) * 0.18;
-        const radiusX = townRadius * (isMajorCapital ? 0.68 : 0.7) * (0.78 + (index % 3) * 0.08);
-        const radiusY = townRadius * (isMajorCapital ? 0.42 : 0.46) * (0.82 + (index % 4) * 0.05);
-        const dx = Math.cos(angle) * radiusX;
-        const dy = Math.sin(angle) * radiusY;
+        const slot = blockSlots[(index + city.recommendedLevel) % blockSlots.length];
+        const jitterX = (((index * 37 + city.recommendedLevel * 11) % 19) - 9) * 1.8;
+        const jitterY = (((index * 29 + city.recommendedLevel * 7) % 17) - 8) * 1.4;
+        const dx = slot[0] * townRadius + jitterX;
+        const dy = slot[1] * townRadius + jitterY;
         const texture = houseTextures[(index + city.recommendedLevel) % houseTextures.length];
         const houseScale =
           isGrandCapital
@@ -6291,7 +6522,7 @@ export class WorldScene extends Phaser.Scene {
                 : city.kind === "sanctum"
                   ? 0.58
                   : 0.64;
-        placeStructure(texture, dx, dy, houseScale, angle * 0.06, 5.95);
+        placeStructure(texture, dx, dy, houseScale, ((index % 3) - 1) * 0.035, 5.95);
       }
 
       if (isMajorCapital) {
@@ -6338,22 +6569,11 @@ export class WorldScene extends Phaser.Scene {
         placeStructure("decor-wave", -townRadius * 0.6, townRadius * 0.76, 0.56, -0.05, 5.92);
         placeStructure("decor-wave", townRadius * 0.6, townRadius * 0.78, 0.54, 0.05, 5.92);
       }
-      if (isGrandCapital) {
-        graphics.lineStyle(14, 0xfacc15, 0.2);
-        graphics.strokeEllipse(city.position.x, city.position.y, townRadius * 2.45, townRadius * 1.55);
-        graphics.lineStyle(6, 0xfef3c7, 0.22);
-        graphics.strokeEllipse(city.position.x, city.position.y, townRadius * 1.32, townRadius * 0.84);
-      }
-      if (city.kind === "fortress") {
-        graphics.lineStyle(10, 0x94a3b8, 0.18);
-        graphics.strokeEllipse(city.position.x, city.position.y, townRadius * 2.16, townRadius * 1.42);
-      }
       if (city.kind === "sanctum") {
-        graphics.lineStyle(5, 0xa78bfa, 0.34);
-        graphics.strokeCircle(city.position.x, city.position.y, townRadius * 0.72);
-        graphics.strokeCircle(city.position.x, city.position.y, townRadius * 0.46);
         graphics.fillStyle(0xddd6fe, 0.36);
-        graphics.fillCircle(city.position.x, city.position.y - 8, 42);
+        graphics.fillRoundedRect(city.position.x - 46, city.position.y - 54, 92, 92, 18);
+        graphics.lineStyle(5, 0xa78bfa, 0.34);
+        graphics.strokeRoundedRect(city.position.x - 92, city.position.y - 86, 184, 156, 28);
       }
       if (city.kind === "outpost") {
         placeStructure("city-tent", -townRadius * 0.44, -townRadius * 0.24, 0.54, -0.1, 6.08);
@@ -6381,21 +6601,29 @@ export class WorldScene extends Phaser.Scene {
       const isGrandCapital = city.id === "crownspire";
       const isMajorCapital = isHub || isGrandCapital;
       const townRadius = cityVisualRadius(city);
-      const width = isGrandCapital ? 500 : isHub ? 390 : townRadius * (city.kind === "outpost" ? 0.82 : 0.92);
-      const height = isGrandCapital ? 290 : isHub ? 230 : townRadius * (city.kind === "outpost" ? 0.52 : 0.58);
+      const width = isGrandCapital ? 430 : isHub ? 320 : townRadius * (city.kind === "outpost" ? 0.68 : 0.76);
+      const height = isGrandCapital ? 238 : isHub ? 184 : townRadius * (city.kind === "outpost" ? 0.42 : 0.48);
       const x = city.position.x;
       const y = city.position.y;
 
-      graphics.fillStyle(0x3a2417, isMajorCapital ? 0.045 : 0.065);
-      graphics.fillEllipse(x, y + 10, width + 54, height + 36);
-      graphics.fillStyle(0x594129, isMajorCapital ? 0.78 : 0.86);
-      graphics.fillEllipse(x, y + 4, width, height);
-      graphics.fillStyle(isGrandCapital ? 0xd6a15d : 0x73563a, isGrandCapital ? 0.24 : isHub ? 0.34 : 0.48);
-      graphics.fillEllipse(x - width * 0.1, y - height * 0.08, width * 0.58, height * 0.5);
-      graphics.lineStyle(4, 0xd6a15d, 0.22);
-      graphics.strokeEllipse(x, y + 4, width, height);
-      graphics.lineStyle(2, 0x2f2418, 0.2);
-      graphics.strokeEllipse(x, y + 4, width * 0.7, height * 0.62);
+      // The old plaza was a literal rectangular crop of the cobblestone sprite.
+      // A compact oval pad blends road junctions without looking pasted onto every town.
+      graphics.fillStyle(0x9d7745, isMajorCapital ? 0.16 : 0.12);
+      graphics.fillEllipse(x, y + 10, width, height * 0.78);
+      graphics.fillStyle(0xf0d9ad, isMajorCapital ? 0.9 : 0.82);
+      graphics.fillEllipse(x, y + 2, width * 0.92, height * 0.68);
+      graphics.lineStyle(5, 0xc59d63, 0.2);
+      graphics.strokeEllipse(x, y + 4, width * 0.9, height * 0.65);
+
+      const stoneCount = isMajorCapital ? 9 : 6;
+      for (let index = 0; index < stoneCount; index += 1) {
+        const angle = (index / stoneCount) * Math.PI * 2 + city.recommendedLevel * 0.17;
+        const radius = index % 3 === 0 ? 0.31 : 0.23;
+        const stoneX = x + Math.cos(angle) * width * radius;
+        const stoneY = y + Math.sin(angle) * height * radius * 0.62;
+        graphics.fillStyle(index % 2 === 0 ? 0xe2c792 : 0xf8e7c1, 0.42);
+        graphics.fillEllipse(stoneX, stoneY, width * (0.1 + (index % 3) * 0.012), height * (0.12 + (index % 2) * 0.025));
+      }
     };
     const drawCheckpointFire = (city: (typeof CITY_DEFINITIONS)[number]) => {
       const isHub = city.id === "greenhill";
@@ -6719,117 +6947,18 @@ export class WorldScene extends Phaser.Scene {
     };
     const biomePalette = (kind: (typeof WORLD_MAP_REGIONS)[number]["kind"]) => {
       const palettes = {
-        grass: { color: 0x72b83f, accent: 0xe4ff9d, alpha: 0.62 },
-        forest: { color: 0x33933d, accent: 0x9df56b, alpha: 0.8 },
-        darkForest: { color: 0x2f5a3a, accent: 0xa7f3d0, alpha: 0.76 },
-        desert: { color: 0xd9a13d, accent: 0xffe08a, alpha: 0.8 },
-        snow: { color: 0xc7dfe9, accent: 0xffffff, alpha: 0.58 },
-        swamp: { color: 0x3c8d62, accent: 0xb5f36c, alpha: 0.76 },
-        coast: { color: 0xe0bf69, accent: 0x67e8f9, alpha: 0.42 },
-        fire: { color: 0x8f3e25, accent: 0xffb020, alpha: 0.86 },
-        void: { color: 0x4b2c72, accent: 0xd8b4fe, alpha: 0.86 },
-        mountain: { color: 0x87919b, accent: 0xf8fafc, alpha: 0.66 }
+        grass: { color: 0x8eea4f, accent: 0xf0ffc2, alpha: 0.34 },
+        forest: { color: 0x66df58, accent: 0xcaff85, alpha: 0.4 },
+        darkForest: { color: 0x54c875, accent: 0xbfffd7, alpha: 0.42 },
+        desert: { color: 0xf4c85e, accent: 0xffedaa, alpha: 0.38 },
+        snow: { color: 0xdcedf4, accent: 0xffffff, alpha: 0.32 },
+        swamp: { color: 0x4bd59c, accent: 0xc9ff91, alpha: 0.4 },
+        coast: { color: 0xf2d57d, accent: 0xa6f3ff, alpha: 0.3 },
+        fire: { color: 0xec7954, accent: 0xffc766, alpha: 0.52 },
+        void: { color: 0x9271d4, accent: 0xe9dcff, alpha: 0.54 },
+        mountain: { color: 0xb9cbd7, accent: 0xffffff, alpha: 0.34 }
       } as const;
       return palettes[kind];
-    };
-    const drawGreenhillHuntingMeadow = () => {
-      const center = { x: 3150, y: 3400 };
-      const width = 5600;
-      const height = 3400;
-      const pointCount = 42;
-      const organicPoints = (scale: number): Vector2[] =>
-        Array.from({ length: pointCount }, (_, index) => {
-          const angle = (index / pointCount) * Math.PI * 2;
-          const wobble =
-            1 +
-            Math.sin(angle * 3 + 0.4) * 0.075 +
-            Math.sin(angle * 7 + 1.7) * 0.045 +
-            (((index * 29) % 15) - 7) * 0.006;
-          return {
-            x: center.x + Math.cos(angle) * (width / 2) * scale * wobble,
-            y: center.y + Math.sin(angle) * (height / 2) * scale * wobble
-          };
-        });
-      const fillOrganic = (points: Vector2[]) => {
-        graphics.beginPath();
-        graphics.moveTo(points[0].x, points[0].y);
-        points.slice(1).forEach((point) => graphics.lineTo(point.x, point.y));
-        graphics.closePath();
-        graphics.fillPath();
-      };
-
-      graphics.fillStyle(0x1b4f22, 0.08);
-      fillOrganic(organicPoints(1.2));
-      graphics.fillStyle(0x78bc3f, 0.22);
-      fillOrganic(organicPoints(1.03));
-      graphics.fillStyle(0x96d84d, 0.16);
-      fillOrganic(organicPoints(0.78));
-      graphics.fillStyle(0xf1f5a8, 0.08);
-      fillOrganic(organicPoints(0.52));
-
-      for (let index = 0; index < 46; index += 1) {
-        const angle = ((index * 137.508) % 360) * Phaser.Math.DEG_TO_RAD;
-        const radius = Math.sqrt(((index * 71) % 997) / 997);
-        const x = center.x + Math.cos(angle) * width * 0.42 * radius;
-        const y = center.y + Math.sin(angle) * height * 0.36 * radius;
-        const noise = roadNoise(index * 37 + 11);
-        graphics.fillStyle(index % 5 === 0 ? 0xfef08a : index % 5 === 1 ? 0xffffff : 0xb8e866, 0.12 + noise * 0.11);
-        graphics.fillEllipse(x, y, 42 + noise * 62, 12 + noise * 18);
-        if (index % 4 === 0) {
-          graphics.fillStyle(0x2f7d36, 0.08 + noise * 0.06);
-          graphics.fillEllipse(x - 12, y + 8, 72 + noise * 46, 24 + noise * 18);
-        }
-      }
-
-      const edgeCount = 34;
-      for (let index = 0; index < edgeCount; index += 1) {
-        const angle = (index / edgeCount) * Math.PI * 2 + roadNoise(index * 19) * 0.08;
-        const x = center.x + Math.cos(angle) * width * 0.54 * (0.92 + roadNoise(index * 17) * 0.18);
-        const y = center.y + Math.sin(angle) * height * 0.44 * (0.9 + roadNoise(index * 23) * 0.18);
-        const dark = index % 3 === 0;
-        graphics.fillStyle(dark ? 0x0f351b : 0x1f5f2c, 0.18);
-        graphics.fillCircle(x, y, 42 + roadNoise(index * 31) * 38);
-        graphics.fillStyle(0x071f10, 0.14);
-        graphics.fillEllipse(x + 16, y + 28, 82, 24);
-      }
-    };
-    const drawStarterArenaGroundBlend = () => {
-      const { x, y } = WORLD_STARTER_ARENA.center;
-      const radius = WORLD_STARTER_ARENA.radius + 360;
-      const organicPoints = (scale: number): Vector2[] =>
-        Array.from({ length: 34 }, (_, index) => {
-          const angle = (index / 34) * Math.PI * 2;
-          const wobble = 1 + Math.sin(angle * 3 + 0.7) * 0.08 + Math.sin(angle * 7 + 1.8) * 0.045;
-          return {
-            x: x + Math.cos(angle) * radius * scale * wobble,
-            y: y + Math.sin(angle) * radius * 0.86 * scale * wobble
-          };
-        });
-      const fillOrganic = (points: Vector2[]) => {
-        graphics.beginPath();
-        graphics.moveTo(points[0].x, points[0].y);
-        points.slice(1).forEach((point) => graphics.lineTo(point.x, point.y));
-        graphics.closePath();
-        graphics.fillPath();
-      };
-      graphics.fillStyle(0x3a2619, 0.28);
-      fillOrganic(organicPoints(1.08));
-      graphics.fillStyle(0x4a3420, 0.58);
-      fillOrganic(organicPoints(0.98));
-      graphics.fillStyle(0x6d4d2d, 0.14);
-      graphics.fillEllipse(x + 150, y + 120, radius * 0.95, radius * 0.52);
-      graphics.fillStyle(0x2f4f2c, 0.1);
-      graphics.fillEllipse(x - 360, y - 280, radius * 0.5, radius * 0.32);
-
-      for (let index = 0; index < 12; index += 1) {
-        const angle = ((index * 137.5) % 360) * Phaser.Math.DEG_TO_RAD;
-        const distance = WORLD_STARTER_ARENA.innerRadius + 240 + ((index * 73) % 330);
-        const px = x + Math.cos(angle) * distance;
-        const py = y + Math.sin(angle) * distance * 0.92;
-        const noise = roadNoise(index * 41 + 17);
-        graphics.fillStyle(index % 3 === 0 ? 0x8b6c45 : 0x3f5f31, 0.08 + noise * 0.06);
-        graphics.fillEllipse(px, py, 48 + noise * 34, 14 + noise * 12);
-      }
     };
     const drawStarterArena = () => {
       const { x, y } = WORLD_STARTER_ARENA.center;
@@ -6867,19 +6996,17 @@ export class WorldScene extends Phaser.Scene {
           graphics.lineBetween(start.x, start.y, end.x, end.y);
         }
       };
-      graphics.fillStyle(0x120907, 0.5);
-      graphics.fillCircle(x, y + 24, radius + 82);
-      graphics.fillStyle(0x43180f, 0.76);
+      graphics.fillStyle(0xb96f45, 1);
       graphics.fillCircle(x, y, radius);
-      graphics.fillStyle(0x74351f, 0.62);
+      graphics.fillStyle(0xd58a57, 0.96);
       graphics.fillCircle(x, y, innerRadius);
-      graphics.fillStyle(0x9a552d, 0.18);
+      graphics.fillStyle(0xf0b46c, 0.22);
       graphics.fillCircle(x, y, Math.max(120, innerRadius * 0.44));
-      graphics.lineStyle(10, 0x3a2417, 0.38);
+      graphics.lineStyle(10, 0x70442c, 0.52);
       graphics.strokeCircle(x, y, radius + 10);
-      graphics.lineStyle(4, 0xfacc15, 0.12);
+      graphics.lineStyle(4, 0xf3c17d, 0.18);
       graphics.strokeCircle(x, y, radius - 34);
-      graphics.lineStyle(5, 0xfacc15, 0.28);
+      graphics.lineStyle(5, 0xf8d49a, 0.32);
       graphics.strokeCircle(x, y, innerRadius);
       graphics.strokeCircle(x, y, Math.max(120, innerRadius * 0.44));
 
@@ -6887,15 +7014,6 @@ export class WorldScene extends Phaser.Scene {
       drawWallArc(0, 28, 0x3a2417, 0.94);
       drawWallArc(-5, 10, 0x7c4a25, 0.88);
       drawWallArc(-12, 4, 0xeab76c, 0.42);
-
-      WORLD_STARTER_ARENA_GATES.forEach((gate) => {
-        const center = wallPoint(gate.angle, 2);
-        const left = wallPoint(gate.angle - gateHalfAngle, 16);
-        const right = wallPoint(gate.angle + gateHalfAngle, 16);
-        graphics.lineStyle(8, 0xfacc15, 0.26);
-        graphics.lineBetween(left.x, left.y, center.x, center.y);
-        graphics.lineBetween(center.x, center.y, right.x, right.y);
-      });
 
       Array.from({ length: 7 }, (_, index) => {
         const angle = ((index * 51 + 18) % 360) * Phaser.Math.DEG_TO_RAD;
@@ -6927,6 +7045,7 @@ export class WorldScene extends Phaser.Scene {
     };
     const drawLandmark = (landmark: (typeof WORLD_LANDMARKS)[number]) => {
       const { x, y } = landmark.position;
+      const isDungeonEntrance = landmark.kind === "dungeon" || landmark.kind === "cave";
       const color =
         landmark.kind === "boss" || landmark.kind === "arena"
           ? 0xef4444
@@ -6944,14 +7063,16 @@ export class WorldScene extends Phaser.Scene {
           .setScale(scale)
           .setDepth(depth + dy * 0.0002);
       };
-      graphics.fillStyle(color, landmark.kind === "boss" ? 0.09 : 0.055);
-      graphics.fillCircle(x, y, landmark.radius * 0.92);
-      graphics.lineStyle(2, color, 0.12);
-      graphics.strokeCircle(x, y, landmark.radius * 0.62);
-      graphics.lineStyle(landmark.kind === "boss" ? 10 : 6, color, landmark.kind === "boss" ? 0.32 : 0.2);
-      graphics.strokeCircle(x, y, landmark.radius);
-      graphics.fillStyle(0x050807, 0.54);
-      graphics.fillEllipse(x, y + 34, 210, 58);
+      if (!isDungeonEntrance) {
+        graphics.fillStyle(color, landmark.kind === "boss" ? 0.09 : 0.055);
+        graphics.fillCircle(x, y, landmark.radius * 0.92);
+        graphics.lineStyle(2, color, 0.12);
+        graphics.strokeCircle(x, y, landmark.radius * 0.62);
+        graphics.lineStyle(landmark.kind === "boss" ? 10 : 6, color, landmark.kind === "boss" ? 0.32 : 0.2);
+        graphics.strokeCircle(x, y, landmark.radius);
+        graphics.fillStyle(0x050807, 0.54);
+        graphics.fillEllipse(x, y + 34, 210, 58);
+      }
       if (landmark.kind === "harbor") {
         graphics.fillStyle(0x0e7490, 0.18);
         graphics.fillEllipse(x, y + 74, 430, 128);
@@ -6983,8 +7104,6 @@ export class WorldScene extends Phaser.Scene {
         placeLandmark("decor-wave", -142, 112, 0.7, -0.06, 6.45);
         placeLandmark("decor-wave", 136, 118, 0.7, 0.05, 6.45);
       } else if (landmark.kind === "dungeon" || landmark.kind === "cave") {
-        graphics.fillStyle(0x020617, 0.42);
-        graphics.fillEllipse(x, y + 60, 356, 246);
         graphics.fillStyle(0x1f2937, 0.96);
         graphics.fillEllipse(x, y + 30, 324, 234);
         graphics.fillStyle(0x374151, 0.72);
@@ -7078,27 +7197,21 @@ export class WorldScene extends Phaser.Scene {
     const edgeRight = WORLD_BOUNDS.width + edgePadding;
     const edgeBottom = WORLD_BOUNDS.height + edgePadding;
 
-    graphics.fillStyle(0x083d52, 0.92);
+    // This used to be 0.92 and almost completely buried the grass sprite beneath
+    // a dark blue-green sheet. Keep only a faint unifying tint; seas are painted below.
+    graphics.fillStyle(0x8de8d8, 0.025);
     graphics.fillRect(
       edgeLeft,
       edgeTop,
       WORLD_BOUNDS.width + edgePadding * 2,
       WORLD_BOUNDS.height + edgePadding * 2
     );
-    graphics.fillStyle(0x17351f, 0.24);
+    graphics.fillStyle(0xa4f271, 0.035);
     graphics.fillRect(0, 0, WORLD_BOUNDS.width, WORLD_BOUNDS.height);
-
-    graphics.lineStyle(1, 0x24422e, 0.012);
-    for (let x = 0; x <= WORLD_BOUNDS.width; x += 320) {
-      graphics.lineBetween(x, 0, x, WORLD_BOUNDS.height);
-    }
-    for (let y = 0; y <= WORLD_BOUNDS.height; y += 320) {
-      graphics.lineBetween(0, y, WORLD_BOUNDS.width, y);
-    }
 
     const drawSmoothSea = (shorePoints: Vector2[], side: "west" | "south" | "north") => {
       const shore = sampleCurve(shorePoints, 20);
-      graphics.fillStyle(0x096b82, 0.86);
+      graphics.fillStyle(0x4fc9d5, 1);
       graphics.beginPath();
       if (side === "west") {
         graphics.moveTo(edgeLeft, edgeTop);
@@ -7119,34 +7232,19 @@ export class WorldScene extends Phaser.Scene {
       graphics.closePath();
       graphics.fillPath();
       [
-        { width: 420, color: 0x0b6f82, alpha: 0.026 },
-        { width: 230, color: 0xd7b86a, alpha: 0.042 },
-        { width: 118, color: 0x8fd8dc, alpha: 0.058 },
-        { width: 48, color: 0xe7d391, alpha: 0.105 },
-        { width: 12, color: 0xe0f7ff, alpha: 0.13 }
+        { width: 96, color: 0x8fd8dc, alpha: 0.045 },
+        { width: 18, color: 0xe0f7ff, alpha: 0.11 }
       ].forEach((layer) => {
         graphics.lineStyle(layer.width, layer.color, layer.alpha);
         strokePolyline(shore);
       });
     };
-    const drawWorldBoundaryBlend = () => {
-      [
-        { offset: -180, width: 520, color: 0x8fd8dc, alpha: 0.024 },
-        { offset: 260, width: 900, color: 0x0b6f82, alpha: 0.048 },
-        { offset: 980, width: 1500, color: 0x083d52, alpha: 0.068 }
-      ].forEach((layer) => {
-        graphics.lineStyle(layer.width, layer.color, layer.alpha);
-        graphics.lineBetween(edgeLeft, WORLD_BOUNDS.height + layer.offset, edgeRight, WORLD_BOUNDS.height + layer.offset);
-        graphics.lineBetween(edgeLeft, -layer.offset, edgeRight, -layer.offset);
-        graphics.lineBetween(-layer.offset, edgeTop, -layer.offset, edgeBottom);
-        graphics.lineBetween(WORLD_BOUNDS.width + layer.offset, edgeTop, WORLD_BOUNDS.width + layer.offset, edgeBottom);
-      });
-    };
     drawBoundedMapGraphics(edgeLeft, edgeTop, 4300, edgeBottom, () => {
       drawSmoothSea(
         [
-          { x: 3600, y: 0 },
-          { x: 2600, y: 900 },
+          { x: 1900, y: 1000 },
+          { x: 1450, y: 1650 },
+          { x: 1100, y: 2500 },
           { x: 980, y: 3000 },
           { x: 1180, y: 6200 },
           { x: 2100, y: 10400 },
@@ -7160,8 +7258,8 @@ export class WorldScene extends Phaser.Scene {
     drawBoundedMapGraphics(edgeLeft, edgeTop, edgeRight, 1900, () => {
       drawSmoothSea(
         [
-          { x: 0, y: 1260 },
-          { x: 2500, y: 920 },
+          { x: 1900, y: 1000 },
+          { x: 2700, y: 700 },
           { x: 5200, y: 760 },
           { x: 9000, y: 560 },
           { x: 13200, y: 740 },
@@ -7191,10 +7289,16 @@ export class WorldScene extends Phaser.Scene {
     });
 
     WORLD_MAP_REGIONS.forEach((region) => {
+      // The two starter-region overlays extend beyond the north-west coast.
+      // Sea is already a complete surface there, so skipping these translucent
+      // overlays removes the giant green triangles without touching inland art.
+      if (isStarterCoastalRegion(region.id)) {
+        return;
+      }
       drawRegionalMapGraphics(region.position, region.width * 1.45, region.height * 1.45, () => {
         const palette = biomePalette(region.kind);
         if (region.kind === "coast") {
-          drawBiome(region.position.x, region.position.y, region.width * 0.82, region.height * 0.72, 0xc6a65c, 0.2, 0xfde68a, region.density ?? 70);
+          drawBiome(region.position.x, region.position.y, region.width * 0.82, region.height * 0.72, 0xc6a65c, 0.1, 0xfde68a, region.density ?? 70);
           return;
         }
 
@@ -7230,11 +7334,9 @@ export class WorldScene extends Phaser.Scene {
     });
     WORLD_LAKES.forEach((lake) => {
       drawRegionalMapGraphics(lake.position, lake.width + 150, lake.height + 96, () => {
-        graphics.fillStyle(0xd6a956, 0.18);
-        graphics.fillEllipse(lake.position.x, lake.position.y, lake.width + 150, lake.height + 96);
-        graphics.fillStyle(0x9fe3ec, 0.2);
-        graphics.fillEllipse(lake.position.x, lake.position.y, lake.width + 54, lake.height + 34);
-        graphics.fillStyle(0x54b7cf, 0.98);
+        graphics.fillStyle(WORLD_WATER_EDGE_COLOR, 0.06);
+        graphics.fillEllipse(lake.position.x, lake.position.y, lake.width + 42, lake.height + 26);
+        graphics.fillStyle(WORLD_WATER_CORE_COLOR, 0.98);
         graphics.fillEllipse(lake.position.x, lake.position.y, lake.width, lake.height);
         graphics.fillStyle(0xc7f9ff, 0.12);
         graphics.fillEllipse(lake.position.x - lake.width * 0.15, lake.position.y - lake.height * 0.14, lake.width * 0.36, lake.height * 0.16);
@@ -7245,6 +7347,7 @@ export class WorldScene extends Phaser.Scene {
           graphics.lineBetween(lake.position.x - length * 0.5, y, lake.position.x + length * 0.5, y + lake.height * 0.012);
         }
       });
+      this.createAnimatedWaterSurface(lake.position, lake.width, lake.height, 0, WORLD_LAKES.indexOf(lake) + 1);
     });
     WORLD_WATERFALLS.forEach((fall, index) =>
       drawRegionalMapGraphics(fall.position, fall.width * 2, fall.height * 2, () => drawWaterfall(fall, index))
@@ -7252,8 +7355,6 @@ export class WorldScene extends Phaser.Scene {
     WORLD_SCENIC_DETAILS.forEach((detail, index) =>
       drawRegionalMapGraphics(detail.position, detail.radius * 2, detail.radius * 1.5, () => drawScenicDetail(detail, index))
     );
-    drawRegionalMapGraphics({ x: 3150, y: 3400 }, 5600, 3400, drawGreenhillHuntingMeadow, 420);
-    drawRegionalMapGraphics(WORLD_STARTER_ARENA.center, (WORLD_STARTER_ARENA.radius + 360) * 2.25, (WORLD_STARTER_ARENA.radius + 360) * 2.05, drawStarterArenaGroundBlend);
     WORLD_MOUNTAINS.forEach((mountain, index) => {
       const size = mountain.size * 18;
       drawRegionalMapGraphics(mountain.position, size * 2.2, size * 1.8, () => {
@@ -7266,14 +7367,14 @@ export class WorldScene extends Phaser.Scene {
 
     const roadWidth = 62;
     const roadStyles = [
-      { widthOffset: 8, fill: 0xc5cdd0, shoulder: 0x8f9da1, edge: 0x46525a, patch: 0x9ca3af, mark: 0xffffff, stone: 0xe5e7eb, mode: "cobble" as const },
-      { widthOffset: 4, fill: 0xd5a24f, shoulder: 0xc58f3a, edge: 0x7a4f22, patch: 0xe9c46d, mark: 0xfce7a6, stone: 0xf6d59d, mode: "sand" as const },
-      { widthOffset: 2, fill: 0x5b477b, shoulder: 0x35265c, edge: 0x1e1439, patch: 0x7c3aed, mark: 0xc4b5fd, stone: 0xa78bfa, mode: "void" as const },
-      { widthOffset: 10, fill: 0x8b6c45, shoulder: 0x6d4d2d, edge: 0x332316, patch: 0xb78b52, mark: 0xf6d59d, stone: 0xd6a15d, mode: "dirt" as const },
-      { widthOffset: 3, fill: 0xdce9ef, shoulder: 0x9fb8c6, edge: 0x526b78, patch: 0xcbd5e1, mark: 0xffffff, stone: 0xf8fafc, mode: "snow" as const },
-      { widthOffset: 8, fill: 0x8a3a21, shoulder: 0x5a2417, edge: 0x1c0a07, patch: 0xb45309, mark: 0xf97316, stone: 0xfacc15, mode: "ash" as const },
-      { widthOffset: 4, fill: 0x4c3a68, shoulder: 0x2f2546, edge: 0x150f24, patch: 0x8b5cf6, mark: 0xddd6fe, stone: 0xc084fc, mode: "void" as const },
-      { widthOffset: -2, fill: 0x6b8c43, shoulder: 0x496331, edge: 0x203718, patch: 0x86efac, mark: 0xbbf7d0, stone: 0x9cc35f, mode: "forest" as const }
+      { widthOffset: 4, fill: 0xe7d6ad, shoulder: 0xc9aa74, edge: 0xa98655, patch: 0xf0dfba, mark: 0xfff4d8, stone: 0xf7e8c8, mode: "cobble" as const },
+      { widthOffset: 2, fill: 0xf1b96d, shoulder: 0xd99550, edge: 0xb7773c, patch: 0xffcf85, mark: 0xffe4ad, stone: 0xffd99c, mode: "sand" as const },
+      { widthOffset: 0, fill: 0xb8a6cf, shoulder: 0x9c87bb, edge: 0x806ca1, patch: 0xcbbbe0, mark: 0xe8dcf5, stone: 0xd9cdec, mode: "void" as const },
+      { widthOffset: 4, fill: 0xe4a863, shoulder: 0xc8884c, edge: 0xa96d39, patch: 0xf2bd79, mark: 0xffddb0, stone: 0xf6ca8d, mode: "dirt" as const },
+      { widthOffset: 2, fill: 0xc7dfe8, shoulder: 0x9dbbc8, edge: 0x7c9eae, patch: 0xd9edf3, mark: 0xf4fbff, stone: 0xe7f3f7, mode: "snow" as const },
+      { widthOffset: 3, fill: 0xd98965, shoulder: 0xb96c4c, edge: 0x965039, patch: 0xeba17c, mark: 0xffd1b8, stone: 0xf1b194, mode: "ash" as const },
+      { widthOffset: 0, fill: 0xb8a6cf, shoulder: 0x9c87bb, edge: 0x806ca1, patch: 0xcbbbe0, mark: 0xe8dcf5, stone: 0xd9cdec, mode: "void" as const },
+      { widthOffset: -2, fill: 0xb9b86d, shoulder: 0x969c55, edge: 0x78813f, patch: 0xd0d485, mark: 0xf2f3b6, stone: 0xe1df9b, mode: "forest" as const }
     ];
     const roadRoutes = WORLD_ROADS.map((road, index) => {
       const points = [...road.points];
@@ -7287,7 +7388,7 @@ export class WorldScene extends Phaser.Scene {
       return {
         id: road.id,
         points,
-        samples: sampleCurve(points, fullWorldDetailSaver ? 14 : 26),
+        samples: sampleCurve(points, fullWorldDetailSaver ? 20 : 28),
         width: points.length > 0 ? (road.width ?? roadWidth) + style.widthOffset : roadWidth + style.widthOffset,
         fill: style.fill,
         shoulder: style.shoulder,
@@ -7387,7 +7488,6 @@ export class WorldScene extends Phaser.Scene {
       }
     }
 
-    drawBoundedMapGraphics(edgeLeft, edgeTop, edgeRight, edgeBottom, drawWorldBoundaryBlend);
     CITY_DEFINITIONS.forEach((city) =>
       drawRegionalMapGraphics(city.position, city.safeRadius * 1.3, city.safeRadius, () => drawTownPlaza(city), 220)
     );
@@ -7504,39 +7604,46 @@ export class WorldScene extends Phaser.Scene {
       );
     });
 
+    // Dungeon rooms use coordinates on the shared simulation plane. While the
+    // local player is inside one, this camera-fixed opaque backdrop prevents
+    // unrelated overworld terrain just outside the room ellipse from showing
+    // through around its edges. It stays hidden everywhere in the overworld.
+    this.dungeonBackdrop = this.add
+      .rectangle(0, 0, this.scale.width, this.scale.height, 0x090b12, 1)
+      .setDepth(6.1)
+      .setVisible(false);
+
     WORLD_DUNGEON_INTERIORS.forEach((dungeon, dungeonIndex) => {
-      const graphics = this.add.graphics().setDepth(-8.94);
+      // Dungeon coordinates share the same large simulation plane as the
+      // overworld. Keep an opaque room floor above terrain, rivers and roads so
+      // those layers cannot bleed through when a player enters a dungeon.
+      const graphics = this.add.graphics().setDepth(6.18);
       const seed = dungeon.position.x * 0.001 + dungeonIndex * 0.83;
-      graphics.fillStyle(0x020617, 0.72);
+      graphics.fillStyle(0x090b12, 1);
+      graphics.fillEllipse(dungeon.position.x, dungeon.position.y + 8, dungeon.width + 96, dungeon.height + 88);
+      graphics.fillStyle(0x242832, 1);
       graphics.fillEllipse(dungeon.position.x, dungeon.position.y, dungeon.width, dungeon.height);
-      graphics.lineStyle(12, 0x4c1d95, 0.38);
+      graphics.lineStyle(14, 0x5b496d, 0.72);
       graphics.strokeEllipse(dungeon.position.x, dungeon.position.y, dungeon.width, dungeon.height);
-      graphics.lineStyle(5, 0x67e8f9, 0.18);
-      graphics.lineBetween(dungeon.start.x, dungeon.start.y, dungeon.position.x, dungeon.position.y);
-      graphics.lineBetween(dungeon.position.x, dungeon.position.y, dungeon.end.x, dungeon.end.y);
-      graphics.fillStyle(0x312e81, 0.18);
-      graphics.fillEllipse(dungeon.position.x, dungeon.position.y, dungeon.width * 0.46, dungeon.height * 0.34);
-      for (let index = 0; index < 10; index += 1) {
-        const angle = (index / 10) * Math.PI * 2 + seed;
-        const radiusX = dungeon.width * (0.22 + (index % 3) * 0.055);
-        const radiusY = dungeon.height * (0.2 + (index % 2) * 0.06);
+      graphics.lineStyle(4, 0x9a8caf, 0.24);
+      graphics.strokeEllipse(dungeon.position.x, dungeon.position.y, dungeon.width - 44, dungeon.height - 44);
+      graphics.fillStyle(0x333846, 0.82);
+      graphics.fillEllipse(dungeon.position.x, dungeon.position.y, dungeon.width * 0.42, dungeon.height * 0.25);
+      graphics.lineStyle(3, 0x67e8f9, 0.13);
+      graphics.lineBetween(dungeon.start.x + 96, dungeon.start.y - 62, dungeon.position.x - dungeon.width * 0.2, dungeon.position.y + dungeon.height * 0.13);
+      graphics.lineBetween(dungeon.position.x + dungeon.width * 0.2, dungeon.position.y - dungeon.height * 0.13, dungeon.end.x - 96, dungeon.end.y + 62);
+      for (let index = 0; index < 6; index += 1) {
+        const angle = (index / 6) * Math.PI * 2 + seed;
+        const radiusX = dungeon.width * 0.32;
+        const radiusY = dungeon.height * 0.31;
         const x = dungeon.position.x + Math.cos(angle) * radiusX;
         const y = dungeon.position.y + Math.sin(angle) * radiusY;
         this.add
           .image(x, y, index % 2 === 0 ? "decor-rune" : "decor-crystal")
-          .setScale(index % 2 === 0 ? 0.58 : 0.46)
+          .setScale(index % 2 === 0 ? 0.5 : 0.42)
           .setRotation(angle * 0.18)
-          .setAlpha(0.72)
+          .setAlpha(0.62)
           .setDepth(6.32 + y * 0.0001);
-      }
-      for (let index = 0; index < 5; index += 1) {
-        const x = dungeon.position.x - dungeon.width * 0.38 + index * dungeon.width * 0.19;
-        const y = dungeon.position.y + Math.sin(seed + index) * dungeon.height * 0.18;
-        this.add
-          .rectangle(x, y, 260, 9, 0x67e8f9, 0.2)
-          .setRotation(seed + index * 0.7)
-          .setDepth(7.05)
-          .setBlendMode(Phaser.BlendModes.ADD);
       }
       this.add
         .text(dungeon.position.x, dungeon.position.y - dungeon.height * 0.55, this.tr(dungeon.label), {
@@ -7675,10 +7782,14 @@ export class WorldScene extends Phaser.Scene {
       const radiusY = visualRadius * (isHub || isGrandCapital ? 0.46 : 0.43);
       const propCount = isHub || isGrandCapital ? 9 : 5;
       const houseTextures = ["city-house", "city-house-blue", "city-house-green", "city-house-stone"] as const;
+      const blockSlots = [
+        [-0.78, -0.62], [-0.28, -0.7], [0.34, -0.66], [0.78, -0.48], [0.82, 0.12],
+        [0.6, 0.62], [0.06, 0.7], [-0.48, 0.64], [-0.82, 0.22]
+      ] as const;
       for (let index = 0; index < propCount; index += 1) {
-        const angle = (index / propCount) * Math.PI * 2 + (city.position.x % 37) * 0.004;
-        const x = city.position.x + Math.cos(angle) * radiusX;
-        const y = city.position.y + Math.sin(angle) * radiusY;
+        const slot = blockSlots[(index * 2 + city.recommendedLevel) % blockSlots.length];
+        const x = city.position.x + slot[0] * radiusX;
+        const y = city.position.y + slot[1] * radiusY;
         const texture =
           city.kind === "harbor" && index === propCount - 1
             ? "city-dock"
@@ -7699,7 +7810,7 @@ export class WorldScene extends Phaser.Scene {
                   : 0.48;
         this.add
           .image(x, y, texture)
-          .setRotation(texture === "city-dock" ? angle + Math.PI / 2 : angle * 0.08)
+          .setRotation(texture === "city-dock" ? Math.PI / 2 : ((index % 3) - 1) * 0.04)
           .setScale(scale)
           .setAlpha(0.82)
           .setDepth(6.36 + y * 0.00014);
@@ -7787,7 +7898,9 @@ export class WorldScene extends Phaser.Scene {
                 ? 0xd1d5db
                 : 0xfacc15;
       const radius = Phaser.Math.Clamp(landmark.radius * 0.22, 54, 120);
-      this.add.circle(x, y, radius * 1.7, color, landmark.kind === "boss" ? 0.11 : 0.065).setStrokeStyle(4, color, landmark.kind === "boss" ? 0.34 : 0.2).setDepth(6.58);
+      if (landmark.kind !== "dungeon" && landmark.kind !== "cave") {
+        this.add.circle(x, y, radius * 1.7, color, landmark.kind === "boss" ? 0.11 : 0.065).setStrokeStyle(4, color, landmark.kind === "boss" ? 0.34 : 0.2).setDepth(6.58);
+      }
       if (landmark.kind === "dungeon" || landmark.kind === "cave") {
         this.add.ellipse(x, y + 12, radius * 2.15, radius * 1.68, 0x1f2937, 0.9).setStrokeStyle(3, 0x64748b, 0.26).setDepth(6.64);
         this.add.ellipse(x, y + 28, radius * 0.9, radius * 0.72, 0x020617, 0.98).setStrokeStyle(3, color, 0.55).setDepth(6.66);
@@ -8184,6 +8297,17 @@ export class WorldScene extends Phaser.Scene {
 
   private isMobileTouchMode(): boolean {
     return this.mobileRuntime;
+  }
+
+  private isSafariMemorySafeMode(): boolean {
+    if (typeof window !== "undefined" && new URLSearchParams(window.location.search).get("safariSafe") === "1") {
+      return true;
+    }
+    if (typeof navigator === "undefined") {
+      return false;
+    }
+    const userAgent = navigator.userAgent;
+    return /Safari/i.test(userAgent) && !/(Chrome|Chromium|CriOS|Edg|OPR|FxiOS|Android)/i.test(userAgent);
   }
 
   private isMobileJoystickMode(): boolean {
@@ -8921,13 +9045,16 @@ export class WorldScene extends Phaser.Scene {
     }
 
     const canvas = this.game.canvas;
+    let canvasBounds = canvas.getBoundingClientRect();
+    const refreshCanvasBounds = () => {
+      canvasBounds = canvas.getBoundingClientRect();
+    };
     const toCanvasPoint = (clientX: number, clientY: number): Vector2 => {
-      const rect = canvas.getBoundingClientRect();
-      const scaleX = rect.width > 0 ? this.scale.width / rect.width : 1;
-      const scaleY = rect.height > 0 ? this.scale.height / rect.height : 1;
+      const scaleX = canvasBounds.width > 0 ? this.scale.width / canvasBounds.width : 1;
+      const scaleY = canvasBounds.height > 0 ? this.scale.height / canvasBounds.height : 1;
       return {
-        x: (clientX - rect.left) * scaleX,
-        y: (clientY - rect.top) * scaleY
+        x: (clientX - canvasBounds.left) * scaleX,
+        y: (clientY - canvasBounds.top) * scaleY
       };
     };
     const startJoystick = (point: Vector2, id: number, nativeTouchId?: number) => {
@@ -9033,6 +9160,7 @@ export class WorldScene extends Phaser.Scene {
       return undefined;
     };
     const onTouchStart = (event: TouchEvent) => {
+      refreshCanvasBounds();
       this.resumeAudio();
       let handled = false;
       for (let index = 0; index < event.changedTouches.length; index += 1) {
@@ -9376,7 +9504,7 @@ export class WorldScene extends Phaser.Scene {
       return;
     }
 
-    const dt = Math.min(0.05, Math.max(0, (time - this.lastLocalPredictionAt) / 1000));
+    const dt = Math.min(LOCAL_PREDICTION_MAX_FRAME_SECONDS, Math.max(0, (time - this.lastLocalPredictionAt) / 1000));
     this.lastLocalPredictionAt = time;
     if (dt <= 0) {
       return;
@@ -9444,7 +9572,11 @@ export class WorldScene extends Phaser.Scene {
         view.velocity,
         time,
         playerInterpolationDelayMs,
-        mobile ? this.mobileExtrapolateLimitMs() : REMOTE_EXTRAPOLATE_LIMIT_MS
+        this.adaptiveNetworkExtrapolateLimitMs(
+          view.positionHistory,
+          mobile ? this.mobileExtrapolateLimitMs() : REMOTE_EXTRAPOLATE_LIMIT_MS,
+          mobile ? REMOTE_MOBILE_MAX_EXTRAPOLATE_LIMIT_MS : REMOTE_MAX_EXTRAPOLATE_LIMIT_MS
+        )
       );
       const nextPosition = this.smoothNetworkPosition(view.lastPosition, predicted, frameDt, mobile ? this.mobileRemoteSmoothStiffness() : 36, 760);
       view.lastPosition = nextPosition;
@@ -9482,7 +9614,11 @@ export class WorldScene extends Phaser.Scene {
         view.velocity,
         time,
         monsterInterpolationDelayMs,
-        mobile ? this.mobileExtrapolateLimitMs() : REMOTE_EXTRAPOLATE_LIMIT_MS
+        this.adaptiveNetworkExtrapolateLimitMs(
+          view.positionHistory,
+          mobile ? this.mobileExtrapolateLimitMs() : REMOTE_EXTRAPOLATE_LIMIT_MS,
+          mobile ? REMOTE_MOBILE_MAX_EXTRAPOLATE_LIMIT_MS : REMOTE_MAX_EXTRAPOLATE_LIMIT_MS
+        )
       );
       const nextPosition = this.smoothNetworkPosition(view.lastPosition, predicted, frameDt, mobile ? this.mobileRemoteSmoothStiffness() : 34, 680);
       view.lastPosition = nextPosition;
@@ -9553,11 +9689,11 @@ export class WorldScene extends Phaser.Scene {
     const enchantLevel = player.weaponEnchantLevel ?? 0;
     view.body
       .setVisible(true)
-      .setTexture(this.playerBodyTexture(player))
+      .setTexture(this.playerBodyTexture(player, "idle-a", false))
       .setPosition(visualPosition.x, visualPosition.y + (seatedVendor ? 7 : 0))
       .setRotation(player.downed ? Math.PI / 2 : seatedVendor ? angle * 0.05 + dance.rotation + 0.16 : angle * 0.08 + dance.rotation)
       .setAlpha(player.hp > 0 ? 1 : 0.25)
-      .setTint(player.blocking ? 0x93c5fd : this.raceTint(player.race));
+      .setTint(player.blocking ? 0x93c5fd : 0xffffff);
     this.positionCustomPlayerHead(view, player, visualPosition, angle, dance.rotation);
     view.weapon
       .setVisible(player.hp > 0 && !player.downed && !seatedVendor)
@@ -9624,12 +9760,14 @@ export class WorldScene extends Phaser.Scene {
     const last = history[history.length - 1];
     if (last && serverTime <= last.serverTime) {
       last.position = { ...position };
+      last.receivedAt = this.time.now;
       return;
     }
 
     history.push({
       position: { ...position },
-      serverTime
+      serverTime,
+      receivedAt: this.time.now
     });
     while (history.length > REMOTE_NETWORK_HISTORY_LIMIT) {
       history.shift();
@@ -9640,7 +9778,8 @@ export class WorldScene extends Phaser.Scene {
     history.length = 0;
     history.push({
       position: { ...position },
-      serverTime: Number.isFinite(serverTime) ? serverTime : Date.now()
+      serverTime: Number.isFinite(serverTime) ? serverTime : Date.now(),
+      receivedAt: this.time.now
     });
   }
 
@@ -9712,8 +9851,41 @@ export class WorldScene extends Phaser.Scene {
 
     intervals.sort((a, b) => a - b);
     const median = intervals[Math.floor(intervals.length / 2)] ?? baseDelayMs;
-    const adaptiveDelay = median * 1.42;
+    // Server timestamps stay perfectly regular even when VPN/TCP delivers two
+    // snapshots in a burst. Arrival-vs-server drift exposes that real jitter,
+    // so grow the render buffer only while the connection is actually uneven.
+    const jitterMs = this.networkArrivalJitterMs(history);
+    const adaptiveDelay = median * 1.42 + jitterMs * 1.2;
     return Phaser.Math.Clamp(Math.max(baseDelayMs, adaptiveDelay), baseDelayMs, maxDelayMs);
+  }
+
+  private adaptiveNetworkExtrapolateLimitMs(history: NetworkPositionSample[], baseLimitMs: number, maxLimitMs: number): number {
+    const jitterMs = this.networkArrivalJitterMs(history);
+    return Phaser.Math.Clamp(baseLimitMs + jitterMs * 1.35, baseLimitMs, maxLimitMs);
+  }
+
+  private networkArrivalJitterMs(history: NetworkPositionSample[]): number {
+    if (history.length < 3) {
+      return 0;
+    }
+
+    const samples: number[] = [];
+    for (let index = 1; index < history.length; index += 1) {
+      const previous = history[index - 1];
+      const next = history[index];
+      const serverInterval = next.serverTime - previous.serverTime;
+      const arrivalInterval = next.receivedAt - previous.receivedAt;
+      if (serverInterval <= 0 || arrivalInterval < 0 || serverInterval >= 1000 || arrivalInterval >= 1500) {
+        continue;
+      }
+      samples.push(Math.abs(arrivalInterval - serverInterval));
+    }
+    if (samples.length === 0) {
+      return 0;
+    }
+
+    samples.sort((a, b) => a - b);
+    return samples[Math.floor((samples.length - 1) * 0.75)] ?? 0;
   }
 
   private smoothNetworkPosition(current: Vector2, target: Vector2, frameDt: number, stiffness: number, snapThreshold: number): Vector2 {
@@ -11293,7 +11465,7 @@ export class WorldScene extends Phaser.Scene {
     if (!view) {
       const customHead = this.createCustomPlayerHead(player);
       view = {
-        body: this.add.image(player.position.x, player.position.y, this.playerBodyTexture(player)).setDepth(10).setScale(0.62),
+        body: this.add.image(player.position.x, player.position.y, this.playerBodyTexture(player, "idle-a", false)).setDepth(10).setScale(PLAYER_CHARACTER_SCALE),
         customHead,
         facing: this.add.circle(player.position.x + 34, player.position.y, 5, 0xfacc15, 0).setVisible(false).setDepth(12),
         weaponGlow: this.add
@@ -11322,7 +11494,7 @@ export class WorldScene extends Phaser.Scene {
         lastPosition: { ...player.position },
         serverPosition: { ...player.position },
         velocity: { ...player.velocity },
-        positionHistory: [{ position: { ...player.position }, serverTime }],
+        positionHistory: [{ position: { ...player.position }, serverTime, receivedAt: this.time.now }],
         lastServerAt: this.time.now,
         lastSnapshotSeenAt: this.time.now,
         lastHp: player.hp,
@@ -11396,9 +11568,9 @@ export class WorldScene extends Phaser.Scene {
         this.snapPlayerFacing(view, player);
       }
       view.body
-        .setTexture(this.playerBodyTexture(player))
+        .setTexture(this.playerBodyTexture(player, "idle-a", false))
         .setAlpha(player.hp > 0 ? 1 : 0.25)
-        .setTint(player.blocking ? 0x93c5fd : this.raceTint(player.race));
+        .setTint(player.blocking ? 0x93c5fd : 0xffffff);
       view.weapon.setTexture(this.playerWeaponTexture(player));
       this.positionPlayerView(view, player, view.lastPosition);
       view.lastHp = player.hp;
@@ -11436,9 +11608,9 @@ export class WorldScene extends Phaser.Scene {
           };
     view.lastPosition = renderPosition;
     view.body
-      .setTexture(this.playerBodyTexture(player))
+      .setTexture(this.playerBodyTexture(player, "idle-a", false))
       .setAlpha(player.hp > 0 ? 1 : 0.25)
-      .setTint(player.blocking ? 0x93c5fd : this.raceTint(player.race));
+      .setTint(player.blocking ? 0x93c5fd : 0xffffff);
     view.weapon.setTexture(this.playerWeaponTexture(player));
     this.positionPlayerView(view, player, renderPosition);
     view.lastHp = player.hp;
@@ -11598,7 +11770,16 @@ export class WorldScene extends Phaser.Scene {
     const compactCrowdSimple = visualMode === "simple" && this.isMobileTouchMode() && this.isCrowdedScene();
     const readableMobileCrowdSimple = compactCrowdSimple && (this.mobileSustainedLeanRuntime || this.mobileDeepSustainRuntime || this.isMobileCoolGraphics() || this.visiblePlayerCount >= 14);
     const enchantLevel = player.weaponEnchantLevel ?? 0;
-	    view.body.setVisible(true).setPosition(visualPosition.x, visualPosition.y + (seatedVendor ? 7 : 0));
+    const bodyFrame = this.playerBodyAnimationFrame(view, player, attackAge, seatedVendor);
+	    view.body
+      .setVisible(true)
+      .setTexture(this.playerBodyTexture(player, bodyFrame, visualMode === "full"))
+      .setPosition(visualPosition.x, visualPosition.y + (seatedVendor ? 7 : 0))
+      .setFlipX(!player.downed && facing.x < -0.08)
+      .setScale(
+        PLAYER_CHARACTER_SCALE * (1 + attackPulse * 0.025),
+        PLAYER_CHARACTER_SCALE * (1 - attackPulse * 0.012)
+      );
 	    view.body.setRotation(player.downed ? Math.PI / 2 : seatedVendor ? angle * 0.05 + dance.rotation + 0.16 : angle * 0.08 + dance.rotation);
     this.positionCustomPlayerHead(view, player, visualPosition, angle, dance.rotation);
     if (readableMobileCrowdSimple) {
@@ -11783,7 +11964,7 @@ export class WorldScene extends Phaser.Scene {
       const view = this.players.get(playerId);
       const player = this.snapshot?.players.find((candidate) => candidate.id === playerId);
       if (view && player) {
-        view.body.setTexture(this.playerBodyTexture(player));
+        view.body.setTexture(this.playerBodyTexture(player, "idle-a", view.visualMode === "full"));
         this.positionCustomPlayerHead(view, player, view.lastPosition, this.facingAngle(player.facing));
       }
     });
@@ -11792,10 +11973,39 @@ export class WorldScene extends Phaser.Scene {
     }
   }
 
-  private playerBodyTexture(player: PlayerPublicState): string {
-    const baseTexture = `char-${player.classId}`;
-    const headlessTexture = `${baseTexture}-headless`;
-    return this.shouldUseCustomPlayerHead(player) && this.textures.exists(headlessTexture) ? headlessTexture : baseTexture;
+  private playerBodyTexture(player: PlayerPublicState, frame: PlayerCharacterFrame = "idle-a", detailed = true): string {
+    return ensurePlayerCharacterTextures(this, player, this.shouldUseCustomPlayerHead(player), detailed)[frame];
+  }
+
+  private playerBodyAnimationFrame(
+    view: PlayerView,
+    player: PlayerPublicState,
+    attackAge: number,
+    seatedVendor: boolean
+  ): PlayerCharacterFrame {
+    if (player.hp <= 0 || player.downed || seatedVendor) {
+      return "idle-a";
+    }
+    if (attackAge >= 0 && attackAge < 210) {
+      return "attack";
+    }
+
+    const isLocalPlayer = player.id === this.localPlayerId;
+    const localMoving = isLocalPlayer && !this.isLocalClickMoveVisualArrived(view.lastPosition) && this.hasLocalMovementIntent();
+    const moving = isLocalPlayer ? localMoving : Math.hypot(view.velocity.x, view.velocity.y) > 14;
+    if (moving) {
+      const phase = this.playerGaitPhase(player.id);
+      const normalized = ((phase % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2);
+      const gaitFrames: readonly PlayerCharacterFrame[] = ["walk-pass-a", "walk-a", "walk-pass-b", "walk-b"];
+      return gaitFrames[Math.floor((normalized / (Math.PI * 2)) * gaitFrames.length) % gaitFrames.length];
+    }
+    const seed = this.stableHash(`${player.id}:body-motion`);
+    return Math.floor((this.time.now + seed) / 720) % 2 === 0 ? "idle-a" : "idle-b";
+  }
+
+  private playerGaitPhase(playerId: string): number {
+    const seed = (this.stableHash(`${playerId}:gait`) % 6283) / 1000;
+    return this.time.now / 105 + seed;
   }
 
   private playerWeaponTexture(player: PlayerPublicState): string {
@@ -12141,7 +12351,7 @@ export class WorldScene extends Phaser.Scene {
     const speed = Math.hypot(view.velocity.x, view.velocity.y);
     const attacking = this.time.now - view.lastAttackCueAt < 240;
     const moving = alive && !attacking && (isLocalPlayer ? localMoving : speed > 14);
-    const phase = this.time.now / (moving ? 105 : 380) + player.id.length * 0.37;
+    const phase = moving ? this.playerGaitPhase(player.id) : this.time.now / 520 + (this.stableHash(`${player.id}:stance`) % 6283) / 1000;
     const forward = { x: Math.cos(angle), y: Math.sin(angle) };
     const side = { x: -Math.sin(angle), y: Math.cos(angle) };
     const baseDrop = 29;
@@ -12154,15 +12364,15 @@ export class WorldScene extends Phaser.Scene {
     view.feet.forEach((foot, index) => {
       const sideSign = index === 0 ? -1 : 1;
       const gait = phase + (sideSign > 0 ? Math.PI : 0);
-      const step = moving ? Math.sin(gait) * 8.4 : Math.sin(gait) * 0.8;
-      const sway = moving ? Math.cos(gait) * 2.1 : 0;
-      const lift = moving ? Math.max(0, Math.sin(gait)) * 2.4 : 0;
+      const step = moving ? Math.sin(gait) * 6.2 : Math.sin(gait) * 0.45;
+      const sway = moving ? Math.cos(gait) * 0.85 : 0;
+      const lift = moving ? Math.max(0, Math.sin(gait)) * 1.75 : 0;
       foot
         .setVisible(alive)
-        .setPosition(position.x + side.x * (8.5 * sideSign + sway) + forward.x * step, position.y + baseDrop + side.y * (3.6 * sideSign + sway) + forward.y * step - lift)
-        .setSize(moving ? 14 : 12, moving ? 7 : 6)
+        .setPosition(position.x + side.x * (8.2 * sideSign + sway) + forward.x * step, position.y + baseDrop + side.y * (3.2 * sideSign + sway) + forward.y * step - lift)
+        .setSize(moving ? 13 : 12, moving ? 6.5 : 6)
         .setAlpha(jumpOffset > 4 ? 0.2 : moving ? 0.92 : 0.58)
-        .setRotation(angle + sideSign * (moving ? 0.42 : 0.2));
+        .setRotation(angle + sideSign * (moving ? 0.2 : 0.12));
     });
   }
 
@@ -12448,44 +12658,23 @@ export class WorldScene extends Phaser.Scene {
       const lane = index % 2;
       const laneIndex = Math.floor(index / 2);
       const laneCount = Math.ceil((count - lane) / 2);
-      const laneProgress = laneCount <= 1 ? 0.66 : Phaser.Math.Linear(0.28, 0.86, laneIndex / (laneCount - 1));
-      const path: Vector2[] =
-        lane === 0
-          ? [
-              { x: -7, y: -4 },
-              { x: -1, y: -6 },
-              { x: 5, y: -9 },
-              { x: 11, y: -13 },
-              { x: 16, y: -17 },
-              { x: 19, y: -19 }
-            ]
-          : [
-              { x: -7, y: 4 },
-              { x: -1, y: 6 },
-              { x: 5, y: 9 },
-              { x: 11, y: 13 },
-              { x: 16, y: 17 },
-              { x: 19, y: 19 }
-            ];
-      const pathPosition = laneProgress * (path.length - 1);
-      const segmentIndex = Math.min(path.length - 2, Math.floor(pathPosition));
-      const segmentProgress = pathPosition - segmentIndex;
-      const from = path[segmentIndex];
-      const to = path[segmentIndex + 1];
-      const dx = to.x - from.x;
-      const dy = to.y - from.y;
+      const laneProgress = laneCount <= 1 ? 0.68 : Phaser.Math.Linear(0.34, 0.86, laneIndex / (laneCount - 1));
+      const start = lane === 0 ? { x: -7, y: 0 } : { x: -8, y: 9 };
+      const end = lane === 0 ? { x: 32, y: -13 } : { x: 23, y: 23 };
+      const dx = end.x - start.x;
+      const dy = end.y - start.y;
       const length = Math.max(1, Math.hypot(dx, dy));
       const normal = { x: -dy / length, y: dx / length };
       return {
-        x: Phaser.Math.Linear(from.x, to.x, segmentProgress) + normal.x * drift * 0.3,
-        y: Phaser.Math.Linear(from.y, to.y, segmentProgress) + normal.y * drift * 0.3
+        x: Phaser.Math.Linear(start.x, end.x, laneProgress) + normal.x * drift * 0.25,
+        y: Phaser.Math.Linear(start.y, end.y, laneProgress) + normal.y * drift * 0.25
       };
     }
 
     const endpoints: Record<PlayerPublicState["classId"], { start: Vector2; end: Vector2 }> = {
-      warrior: { start: { x: -18, y: 28 }, end: { x: 18, y: -26 } },
+      warrior: { start: { x: -13, y: 22 }, end: { x: 22, y: -28 } },
       mage: { start: { x: -18, y: 30 }, end: { x: 19, y: -27 } },
-      tank: { start: { x: -22, y: 34 }, end: { x: 24, y: -24 } },
+      tank: { start: { x: -11, y: 23 }, end: { x: 23, y: -25 } },
       archer: { start: { x: 0, y: 0 }, end: { x: 0, y: 0 } },
       assassin: { start: { x: 0, y: 0 }, end: { x: 0, y: 0 } }
     };
@@ -12503,7 +12692,7 @@ export class WorldScene extends Phaser.Scene {
 
   private playerLabelText(player: PlayerPublicState): string {
     const clanPrefix = player.clanTag ? `[${player.clanTag}] ` : "";
-    const identity = `${clanPrefix}${player.name} ${this.levelLabel(player.level)}`;
+    const identity = `${player.premium ? "◆ " : ""}${clanPrefix}${player.name} ${this.levelLabel(player.level)}`;
     if (player.downed) {
       return `${identity} ${this.tr("[revive]")}`;
     }
@@ -12519,7 +12708,7 @@ export class WorldScene extends Phaser.Scene {
 	    return `${identity}${player.zone === "safe" ? ` ${this.tr("[safe]")}` : ""}`;
 	  }
 
-	  private playerLabelColor(player: PlayerPublicState): string {
+  private playerLabelColor(player: PlayerPublicState): string {
 	    if (player.karma > 0) {
 	      return "#ef4444";
 	    }
@@ -12534,6 +12723,9 @@ export class WorldScene extends Phaser.Scene {
         return blinkToNormal ? "#f8fafc" : this.mixHexColor(0xfb7185, 0xf8fafc, fade);
       }
       return "#fb7185";
+    }
+    if (player.premium) {
+      return "#fde68a";
     }
     if (player.id === this.localPlayerId) {
       return "#bbf7d0";
@@ -12640,7 +12832,7 @@ export class WorldScene extends Phaser.Scene {
         lastPosition: { ...monster.position },
         serverPosition: { ...monster.position },
         velocity: monster.velocity ?? { x: 0, y: 0 },
-        positionHistory: [{ position: { ...monster.position }, serverTime }],
+        positionHistory: [{ position: { ...monster.position }, serverTime, receivedAt: this.time.now }],
         facingAngle: 0,
         facingDirection: "left",
         idleSeed: this.stableHash(monster.id) * 0.01,
@@ -13847,6 +14039,26 @@ export class WorldScene extends Phaser.Scene {
     return undefined;
   }
 
+  private updateDungeonBackdrop(local?: PlayerPublicState): void {
+    if (!this.dungeonBackdrop) {
+      return;
+    }
+    const insideDungeon = Boolean(
+      local &&
+        WORLD_DUNGEON_INTERIORS.some((dungeon) => {
+          const dx = (local.position.x - dungeon.position.x) / Math.max(1, dungeon.width * 0.56);
+          const dy = (local.position.y - dungeon.position.y) / Math.max(1, dungeon.height * 0.56);
+          return dx * dx + dy * dy <= 1.18;
+        })
+    );
+    const camera = this.cameras.main;
+    const zoom = camera.zoom || 1;
+    this.dungeonBackdrop
+      .setVisible(insideDungeon)
+      .setPosition(camera.scrollX + camera.width / zoom / 2, camera.scrollY + camera.height / zoom / 2)
+      .setDisplaySize(camera.width / zoom + 96, camera.height / zoom + 96);
+  }
+
   private handleDungeonAction(action: DungeonAction): void {
     if (this.isInputBlocked()) {
       return;
@@ -14021,11 +14233,11 @@ export class WorldScene extends Phaser.Scene {
 
   private isVisualOpenWaterPosition(position: Vector2, padding = 0): boolean {
     const nearOpenSea =
-      this.isOpenSeaPosition(position) ||
+      this.isOpenSeaPosition(position, 0) ||
       (padding > 0 &&
-        (this.isOpenSeaPosition({ x: position.x - padding, y: position.y }) ||
-          this.isOpenSeaPosition({ x: position.x, y: position.y - padding }) ||
-          this.isOpenSeaPosition({ x: position.x, y: position.y + padding })));
+        (this.isOpenSeaPosition({ x: position.x - padding, y: position.y }, 0) ||
+          this.isOpenSeaPosition({ x: position.x, y: position.y - padding }, 0) ||
+          this.isOpenSeaPosition({ x: position.x, y: position.y + padding }, 0)));
     return (
       this.isVisualLakePosition(position, padding) ||
       position.x < -padding ||
@@ -14048,10 +14260,11 @@ export class WorldScene extends Phaser.Scene {
     );
   }
 
-  private isOpenSeaPosition(position: Vector2): boolean {
+  private isOpenSeaPosition(position: Vector2, landBuffer = 80): boolean {
     const westShore: Vector2[] = [
-      { x: 3600, y: 0 },
-      { x: 2600, y: 900 },
+      { x: 1900, y: 1000 },
+      { x: 1450, y: 1650 },
+      { x: 1100, y: 2500 },
       { x: 980, y: 3000 },
       { x: 1180, y: 6200 },
       { x: 2100, y: 10400 },
@@ -14069,8 +14282,8 @@ export class WorldScene extends Phaser.Scene {
       { x: WORLD_BOUNDS.width, y: 26900 }
     ];
     const northShore: Vector2[] = [
-      { x: 0, y: 1260 },
-      { x: 2500, y: 920 },
+      { x: 1900, y: 1000 },
+      { x: 2700, y: 700 },
       { x: 5200, y: 760 },
       { x: 9000, y: 560 },
       { x: 13200, y: 740 },
@@ -14084,7 +14297,7 @@ export class WorldScene extends Phaser.Scene {
     const shoreX = this.interpolateShoreXAtY(westShore, position.y);
     const shoreY = this.interpolateShoreYAtX(southShore, position.x);
     const northShoreY = this.interpolateShoreYAtX(northShore, position.x);
-    return position.x < shoreX - 80 || position.y > shoreY + 80 || position.y < northShoreY - 80;
+    return position.x < shoreX - landBuffer || position.y > shoreY + landBuffer || position.y < northShoreY - landBuffer;
   }
 
   private interpolateShoreXAtY(points: Vector2[], y: number): number {
@@ -15971,7 +16184,7 @@ export class WorldScene extends Phaser.Scene {
       const sideSign = index % 2 === 0 ? -1 : 1;
       const offset = sideSign * (18 + index * 5);
       const blade = this.trackTransient(
-        this.add.image(from.x + side.x * offset, from.y + side.y * offset, "weapon-assassin").setTint(color).setDepth(84).setScale(0.46).setRotation(angle - 0.55),
+        this.add.image(from.x + side.x * offset, from.y + side.y * offset, "projectile-assassin-blade").setTint(color).setDepth(84).setScale(0.62).setRotation(angle),
         1_100
       );
       const trail = this.trackTransient(this.add.circle(from.x + side.x * offset, from.y + side.y * offset, 9, color, 0.24).setDepth(83).setBlendMode(Phaser.BlendModes.ADD), 1_100);
@@ -15987,7 +16200,7 @@ export class WorldScene extends Phaser.Scene {
           const curve = Math.sin(progress * Math.PI) * offset * 0.55;
           const x = Phaser.Math.Linear(from.x + side.x * offset, hit.x, progress) + side.x * curve;
           const y = Phaser.Math.Linear(from.y + side.y * offset, hit.y, progress) + side.y * curve;
-          blade.setPosition(x, y).setRotation(angle + progress * 4.8);
+          blade.setPosition(x, y).setRotation(angle + sideSign * Math.sin(progress * Math.PI) * 0.22);
           trail.setPosition(x, y);
         },
         onComplete: () => {
@@ -16011,14 +16224,14 @@ export class WorldScene extends Phaser.Scene {
     for (let index = 0; index < bladeCount; index += 1) {
       const angle = (Math.PI * 2 * index) / bladeCount;
       const blade = this.trackTransient(
-        this.add.image(position.x + Math.cos(angle) * radius * 0.18, position.y + Math.sin(angle) * radius * 0.18, "weapon-assassin").setTint(index % 2 === 0 ? color : 0xe9d5ff).setDepth(84).setScale(0.42).setRotation(angle),
+        this.add.image(position.x + Math.cos(angle) * radius * 0.18, position.y + Math.sin(angle) * radius * 0.18, "projectile-assassin-blade").setTint(index % 2 === 0 ? color : 0xe9d5ff).setDepth(84).setScale(0.56).setRotation(angle),
         1_100
       );
       this.tweens.add({
         targets: blade,
         x: position.x + Math.cos(angle + 0.55) * radius * 0.78,
         y: position.y + Math.sin(angle + 0.55) * radius * 0.78,
-        rotation: angle + 4.6,
+        rotation: angle + 0.9,
         alpha: 0,
         duration: 260 + index * 10,
         ease: "Sine.easeOut",
@@ -17313,7 +17526,8 @@ export class WorldScene extends Phaser.Scene {
   resumeAudio(): void {
     const now = this.time.now || performance.now();
     const birdNeedsResume = this.birdAmbientTargetVolume() > BIRD_AMBIENT_MIN_VOLUME && this.audioContext?.state !== "running";
-    if (this.audioContext?.state === "running" && this.singingAudioElementWarmed && !birdNeedsResume && now - this.lastAudioResumeAt < 300) {
+    const singingNeedsResume = [...this.singingAudio.values()].some((handle) => handle.audio.paused || handle.pendingPlay);
+    if (this.audioContext?.state === "running" && this.singingAudioElementWarmed && !birdNeedsResume && !singingNeedsResume) {
       return;
     }
     this.lastAudioResumeAt = now;

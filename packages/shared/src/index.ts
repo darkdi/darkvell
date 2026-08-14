@@ -3,7 +3,8 @@ export const TICK_MS = 1000 / TICK_RATE;
 export const MAX_PLAYERS_PER_WORLD = 3000;
 export const MAX_WEAPON_ENCHANT_LEVEL = 20;
 export const MAX_ARMOR_ENCHANT_LEVEL = 10;
-export const CHARACTER_FACE_VARIANT_COUNT = 96;
+export const CHARACTER_FACE_VARIANTS_PER_GENDER = 96;
+export const CHARACTER_FACE_VARIANT_COUNT = CHARACTER_FACE_VARIANTS_PER_GENDER * 2;
 
 export function xpForNextLevel(level: number): number {
   const tier = Math.max(0, level - 1);
@@ -19,6 +20,17 @@ export const WORLD_BOUNDS = {
 
 export type CharacterClass = "warrior" | "assassin" | "mage" | "archer" | "tank";
 export type CharacterRace = "human" | "elf" | "darkelf" | "orc";
+export type CharacterGender = "male" | "female";
+
+export function characterGenderFromFace(face?: number): CharacterGender {
+  const normalized = Math.max(1, Math.min(CHARACTER_FACE_VARIANT_COUNT, Math.trunc(face ?? 1)));
+  return normalized > CHARACTER_FACE_VARIANTS_PER_GENDER ? "female" : "male";
+}
+
+export function characterFaceStyleVariant(face?: number): number {
+  const normalized = Math.max(1, Math.min(CHARACTER_FACE_VARIANT_COUNT, Math.trunc(face ?? 1)));
+  return ((normalized - 1) % CHARACTER_FACE_VARIANTS_PER_GENDER) + 1;
+}
 export type ZoneKind = "safe" | "pvp" | "boss" | "dungeon";
 export type CurrencyCode = "gold" | "crystal" | "token";
 export type ChatChannel = "local" | "zone" | "dungeon" | "world" | "clan" | "system";
@@ -1395,6 +1407,8 @@ export interface PlayerPublicState {
   level: number;
   xp: number;
   gold: number;
+  premium?: boolean;
+  premiumUntil?: number;
   karma: number;
   pkCount: number;
   pvpCount: number;

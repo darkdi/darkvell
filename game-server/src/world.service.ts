@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Injectable } from "@nestjs/common";
 import {
@@ -99,6 +99,7 @@ interface PlayerPrivateState extends PlayerPublicState {
   offlineMarketSeller?: boolean;
   pendingMarketNotices?: string[];
   activeSkillId?: string;
+  coinPaymentRewardIds: string[];
 }
 
 interface JoinResult {
@@ -199,6 +200,7 @@ interface PersistedCharacter {
   arenaStreak?: number;
   arenaSeasonPoints?: number;
   storyQuestRewards?: string[];
+  coinPaymentRewardIds?: string[];
   hp?: number;
   cp?: number;
   mp?: number;
@@ -225,6 +227,20 @@ interface PersistedModerationState {
   bannedNames?: string[];
   mutedCharacterUntil?: Array<[string, number]>;
   mutedNameUntil?: Array<[string, number]>;
+}
+
+interface PremiumEntitlement {
+  characterId: string;
+  activeUntil?: string;
+  planId?: "week" | "month";
+}
+
+interface CoinPaymentReward {
+  id: string;
+  characterId: string;
+  itemId: "arena-coin";
+  quantity: number;
+  amountKopecks: number;
 }
 
 interface ClassGrowth {
@@ -1900,11 +1916,17 @@ const configuredBotTargetOnline = (): number | null => {
   return Math.min(MAX_CONFIGURED_BOTS, Math.max(0, Math.trunc(value)));
 };
 
+const configuredSingerNpcsEnabled = (): boolean => {
+  const value = String(process.env.GAME_SINGER_NPCS_ENABLED ?? "1").trim().toLowerCase();
+  return value !== "0" && value !== "false" && value !== "off" && value !== "no";
+};
+
 @Injectable()
 export class WorldService {
   readonly tickMs = configuredTickMs();
   readonly botCount = configuredBotCount();
   readonly botTargetOnline = configuredBotTargetOnline();
+  readonly singerNpcsEnabled = configuredSingerNpcsEnabled();
 
   private readonly players = new Map<string, PlayerPrivateState>();
   private readonly monsters = new Map<string, MonsterState>();
@@ -1948,6 +1970,12 @@ export class WorldService {
   private readonly clansPath = join(process.cwd(), "data", "clans.json");
   private readonly moderationPath = join(process.cwd(), "data", "moderation.json");
   private readonly feedbackPath = join(process.cwd(), "data", "feedback.json");
+  private readonly premiumEntitlementsPath = process.env.GAME_PREMIUM_ENTITLEMENTS_PATH?.trim() || join(process.cwd(), "data", "premium-entitlements.json");
+  private readonly premiumEntitlements = new Map<string, number>();
+  private lastPremiumEntitlementsLoadAt = 0;
+  private readonly coinPaymentRewardsDir = process.env.GAME_COIN_REWARDS_DIR?.trim() || join(process.cwd(), "data", "coin-payment-rewards");
+  private readonly processedCoinPaymentRewardsDir = join(this.coinPaymentRewardsDir, "processed");
+  private lastCoinPaymentRewardsLoadAt = 0;
   private readonly feedbackReports: FeedbackReport[] = [];
   private feedbackLoaded = false;
   private lastPositionSaveAt = 0;
@@ -1978,7 +2006,9 @@ export class WorldService {
     this.loadCharacters();
     this.loadClans();
     this.loadModeration();
+    this.loadPremiumEntitlements(true);
     this.seedWorld();
+    this.processCoinPaymentRewards(true);
     this.updateBotPopulation(Date.now(), true);
     this.tickTimer = setInterval(() => this.step(), this.tickMs);
   }
@@ -2064,6 +2094,7 @@ export class WorldService {
       arenaStreak: saved?.arenaStreak ?? 0,
       arenaSeasonPoints: Math.max(0, saved?.arenaSeasonPoints ?? 0),
       storyQuestRewards: [...(saved?.storyQuestRewards ?? [])],
+      coinPaymentRewardIds: [...(saved?.coinPaymentRewardIds ?? [])].slice(-100),
       pendingMarketNotices: [...(saved?.marketNotices ?? [])],
       clanId,
       jumpUntil: 0,
@@ -4062,7 +4093,9 @@ export class WorldService {
     }
 
     if (resource.kind === "chest") {
-      const gold = Math.round(this.randomBetween(18, 65) + Math.max(1, player.level) * this.randomBetween(2.5, 7.5));
+      const gold =
+        Math.round(this.randomBetween(18, 65) + Math.max(1, player.level) * this.randomBetween(2.5, 7.5)) *
+        (this.premiumActive(player) ? 2 : 1);
       player.gold += gold;
       const item = this.randomChestItem(player);
       if (item) {
@@ -4555,7 +4588,7 @@ export class WorldService {
   }
 
   private updateSingerNpcs(now: number): void {
-    if (this.singerNpcsHiddenByAdmin) {
+    if (!this.singerNpcsEnabled || this.singerNpcsHiddenByAdmin) {
       this.hideSingerNpcs();
       return;
     }
@@ -4694,7 +4727,8 @@ export class WorldService {
       lastConsumableAt: 0,
       lastSafePosition: this.nearestCityPosition(spawn),
       downed: false,
-      tokenDebt: 0
+      tokenDebt: 0,
+      coinPaymentRewardIds: [...(saved?.coinPaymentRewardIds ?? [])].slice(-100)
     };
     this.players.set(npc.id, npc);
     this.singerNpcIds.add(npc.id);
@@ -4947,6 +4981,8 @@ export class WorldService {
     this.updateBotPopulation(now);
     this.updateSingerNpcs(now);
     this.updateSingingPlayers(now);
+    this.loadPremiumEntitlements();
+    this.processCoinPaymentRewards();
 
     for (const [botId, brain] of [...this.botBrains.entries()]) {
       const bot = this.players.get(botId);
@@ -5009,9 +5045,10 @@ export class WorldService {
       player.sitting = true;
       player.input = this.emptyInput();
       player.velocity = { x: 0, y: 0 };
-      player.hp = Math.min(player.maxHp, player.hp + this.healthRegen(player) * dt);
-      player.cp = Math.min(player.maxCp, player.cp + this.cpRegen(player, now) * dt);
-      player.mp = Math.min(player.maxMp, player.mp + this.manaRegen(player.classId) * dt);
+      const premiumRegen = this.premiumActive(player, now) ? 2 : 1;
+      player.hp = Math.min(player.maxHp, player.hp + this.healthRegen(player) * dt * premiumRegen);
+      player.cp = Math.min(player.maxCp, player.cp + this.cpRegen(player, now) * dt * premiumRegen);
+      player.mp = Math.min(player.maxMp, player.mp + this.manaRegen(player.classId) * dt * premiumRegen);
       return;
     }
     if (player.sitting && !player.marketVendor) {
@@ -5039,9 +5076,10 @@ export class WorldService {
           y: (nextPosition.y - previousPosition.y) / dt
         }
       : velocity;
-    player.hp = Math.min(player.maxHp, player.hp + this.healthRegen(player) * dt);
-    player.cp = Math.min(player.maxCp, player.cp + this.cpRegen(player, now) * dt);
-    player.mp = Math.min(player.maxMp, player.mp + this.manaRegen(player.classId) * dt);
+    const premiumRegen = this.premiumActive(player, now) ? 2 : 1;
+    player.hp = Math.min(player.maxHp, player.hp + this.healthRegen(player) * dt * premiumRegen);
+    player.cp = Math.min(player.maxCp, player.cp + this.cpRegen(player, now) * dt * premiumRegen);
+    player.mp = Math.min(player.maxMp, player.mp + this.manaRegen(player.classId) * dt * premiumRegen);
     player.zone = this.zoneFor(player.position);
     if (player.zone === "safe") {
       player.lastSafePosition = this.nearestCityPosition(player.position);
@@ -5747,8 +5785,9 @@ export class WorldService {
     });
 
     if (target.hp <= 0) {
-      const gold = this.monsterGold(target);
-      const xp = this.monsterXp(target);
+      const premium = this.premiumActive(source);
+      const gold = this.monsterGold(target) * (premium ? 2 : 1);
+      const xp = this.monsterXp(target) * (premium ? 2 : 1);
       source.monsterKills[target.archetype] = Math.max(0, source.monsterKills[target.archetype] ?? 0) + 1;
       this.awardXp(source, xp);
       this.cleanseKarmaFromMonster(source, target);
@@ -6200,7 +6239,7 @@ export class WorldService {
         this.dropStackItem(monster.position, potionId, 1, false, monster.id, player.id);
       }
       const lootId = MONSTER_TUNING[monster.archetype].lootId;
-      const lootChance = Math.min(0.36, 0.12 + monster.level * 0.004);
+      const lootChance = Math.min(0.54, (0.12 + monster.level * 0.004) * (this.premiumActive(player) ? 1.5 : 1));
       if (Math.random() < lootChance) {
         const quantity = monster.level >= 24 && Math.random() < 0.24 ? 2 : 1;
         this.dropStackItem(monster.position, lootId, quantity, false, monster.id, player.id);
@@ -7670,7 +7709,8 @@ export class WorldService {
       lastConsumableAt: 0,
       lastSafePosition: this.nearestCityPosition(spawn),
       downed: false,
-	      tokenDebt: 0
+	      tokenDebt: 0,
+      coinPaymentRewardIds: []
 	    };
 
     if (marketVendor) {
@@ -11196,6 +11236,85 @@ export class WorldService {
     }
   }
 
+  private loadPremiumEntitlements(force = false): void {
+    const now = Date.now();
+    if (!force && now - this.lastPremiumEntitlementsLoadAt < 30_000) {
+      return;
+    }
+    this.lastPremiumEntitlementsLoadAt = now;
+    try {
+      const parsed = JSON.parse(readFileSync(this.premiumEntitlementsPath, "utf8")) as PremiumEntitlement[];
+      this.premiumEntitlements.clear();
+      for (const entitlement of parsed) {
+        const until = Date.parse(entitlement.activeUntil ?? "");
+        if (entitlement.characterId && Number.isFinite(until) && until > now) {
+          this.premiumEntitlements.set(entitlement.characterId, until);
+        }
+      }
+    } catch {
+      // Fail closed: a missing or malformed entitlement file never grants
+      // paid bonuses. Existing records are cleared on the initial read only;
+      // transient later read errors keep the last known short-lived snapshot.
+      if (force) {
+        this.premiumEntitlements.clear();
+      }
+    }
+  }
+
+  private premiumActive(player: PlayerPrivateState, now = Date.now()): boolean {
+    if (this.botBrains.has(player.id) || this.singerNpcIds.has(player.id)) {
+      return false;
+    }
+    return (this.premiumEntitlements.get(player.characterId) ?? 0) > now;
+  }
+
+  private processCoinPaymentRewards(force = false): void {
+    const now = Date.now();
+    if (!force && now - this.lastCoinPaymentRewardsLoadAt < 5_000) return;
+    this.lastCoinPaymentRewardsLoadAt = now;
+    mkdirSync(this.coinPaymentRewardsDir, { recursive: true });
+    mkdirSync(this.processedCoinPaymentRewardsDir, { recursive: true });
+    for (const filename of readdirSync(this.coinPaymentRewardsDir).filter((name) => name.endsWith(".json")).slice(0, 40)) {
+      const sourcePath = join(this.coinPaymentRewardsDir, filename);
+      const processedPath = join(this.processedCoinPaymentRewardsDir, filename);
+      try {
+        const reward = JSON.parse(readFileSync(sourcePath, "utf8")) as CoinPaymentReward;
+        if (!reward.id || !reward.characterId || reward.itemId !== "arena-coin" || reward.amountKopecks !== 100 || reward.quantity !== 1) continue;
+        const online = [...this.players.values()].find((player) => player.characterId === reward.characterId && !this.botBrains.has(player.id));
+        if (online) {
+          if (!online.coinPaymentRewardIds.includes(reward.id)) {
+            this.addItem(online, "arena-coin", 1);
+            online.coinPaymentRewardIds = [...online.coinPaymentRewardIds, reward.id].slice(-100);
+            this.event(online.id, online.id, 1, "claim", `${online.name} received 1 Coin from T-Bank payment.`);
+            this.ownerSystemChat(online, "Payment confirmed: 1 Coin added to your inventory.");
+            this.saveCharacter(online);
+          }
+        } else {
+          const saved = this.persistedCharacters.get(reward.characterId);
+          if (!saved) continue;
+          const applied = saved.coinPaymentRewardIds ?? [];
+          if (!applied.includes(reward.id)) {
+            const inventory = saved.inventory.map((item) => this.cloneInventoryItem(item));
+            const coin = inventory.find((item) => item.id === "arena-coin");
+            if (coin) coin.quantity += 1;
+            else inventory.push(this.stackableItem("arena-coin", 1));
+            this.persistedCharacters.set(saved.characterId, {
+              ...saved,
+              inventory,
+              coinPaymentRewardIds: [...applied, reward.id].slice(-100),
+              lastSeenAt: saved.lastSeenAt
+            });
+            this.writeCharacters();
+          }
+        }
+        renameSync(sourcePath, processedPath);
+      } catch {
+        // Leave malformed or temporarily incomplete reward files untouched.
+        // No payment reward is granted unless the full server-side payload validates.
+      }
+    }
+  }
+
   private loadClans(): void {
     try {
       const raw = readFileSync(this.clansPath, "utf8");
@@ -11342,6 +11461,7 @@ export class WorldService {
       arenaStreak: player.arenaStreak,
       arenaSeasonPoints: player.arenaSeasonPoints,
       storyQuestRewards: player.storyQuestRewards,
+      coinPaymentRewardIds: player.coinPaymentRewardIds,
       hp: player.hp <= 0 || player.downed ? 0 : undefined,
       cp: player.hp <= 0 || player.downed ? player.cp : undefined,
       mp: player.hp <= 0 || player.downed ? player.mp : undefined,
@@ -11642,6 +11762,8 @@ export class WorldService {
       level: player.level,
       xp: player.xp,
       gold: player.gold,
+      premium: this.premiumActive(player, now),
+      premiumUntil: this.premiumEntitlements.get(player.characterId),
       karma: player.karma,
       pkCount: player.pkCount,
       pvpCount: player.pvpCount,

@@ -51,6 +51,13 @@ interface SmtpConfig {
 type SmtpSocket = Socket | TLSSocket;
 type AuthLocale = "ru" | "en";
 
+const ACCOUNT_SESSION_DURATION_MS = 30 * 24 * 60 * 60 * 1000;
+const SHORT_SESSION_DURATION_MS = 12 * 60 * 60 * 1000;
+// Existing saved-account tokens were intentionally kept in localStorage for
+// passwordless re-entry, but until now they expired server-side after 12 hours.
+// Keep a bounded migration window long enough to recover those legacy sessions.
+const ACCOUNT_SESSION_REFRESH_GRACE_MS = 365 * 24 * 60 * 60 * 1000;
+
 interface SessionTokenPayload {
   sub?: string;
   username?: string;
@@ -209,6 +216,30 @@ export class AuthService {
     const account = login ? this.accounts.get(login) : undefined;
     if (!account || account.passwordHash !== this.passwordHash(password)) {
       throw new UnauthorizedException("Wrong login or password.");
+    }
+
+    return this.session(account.id, account.character.name, "account", undefined, account.character);
+  }
+
+  refreshAccountSession(token?: string): SessionResponse {
+    this.loadAccounts();
+    const payload = this.verifySessionToken(token, { allowExpired: true });
+    const expiredAt = Date.parse(payload.exp ?? "");
+    if (
+      payload.authProvider !== "account" ||
+      !payload.sub ||
+      !payload.characterId ||
+      !Number.isFinite(expiredAt) ||
+      expiredAt < Date.now() - ACCOUNT_SESSION_REFRESH_GRACE_MS
+    ) {
+      throw new UnauthorizedException("Account session is required.");
+    }
+
+    const account = [...this.accounts.values()].find(
+      (candidate) => candidate.id === payload.sub && candidate.character.id === payload.characterId
+    );
+    if (!account) {
+      throw new UnauthorizedException("Account session is not valid.");
     }
 
     return this.session(account.id, account.character.name, "account", undefined, account.character);
@@ -443,7 +474,8 @@ export class AuthService {
     initData?: string,
     character?: AccountRecord["character"]
   ): SessionResponse {
-    const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 12).toISOString();
+    const durationMs = authProvider === "account" ? ACCOUNT_SESSION_DURATION_MS : SHORT_SESSION_DURATION_MS;
+    const expiresAt = new Date(Date.now() + durationMs).toISOString();
     const payload = Buffer.from(
       JSON.stringify({
         sub: id,
@@ -1156,7 +1188,7 @@ export class AuthService {
     return this.hash(`password:${password}`);
   }
 
-  private verifySessionToken(token?: string): SessionTokenPayload {
+  private verifySessionToken(token?: string, options?: { allowExpired?: boolean }): SessionTokenPayload {
     const [payload, signature] = (token ?? "").split(".");
     if (!payload || !signature || !this.safeEqual(signature, this.hash(payload))) {
       throw new UnauthorizedException("Session token is not valid.");
@@ -1169,7 +1201,7 @@ export class AuthService {
       throw new UnauthorizedException("Session token is not valid.");
     }
 
-    if (parsed.exp && Date.parse(parsed.exp) <= Date.now()) {
+    if (!options?.allowExpired && parsed.exp && Date.parse(parsed.exp) <= Date.now()) {
       throw new UnauthorizedException("Session token expired.");
     }
     return parsed;

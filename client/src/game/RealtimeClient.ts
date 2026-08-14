@@ -53,6 +53,8 @@ export class RealtimeClient {
   private socket?: WebSocket;
   private readonly listeners = new Map<keyof RealtimeEvents, Set<Listener<never>>>();
   private reconnectTimer?: number;
+  private pendingInput?: PlayerInput;
+  private inputFlushTimer?: number;
   private pendingSnapshot?: GameSnapshot;
   private snapshotFrame?: number;
   private lastSnapshotServerTime = 0;
@@ -85,6 +87,8 @@ export class RealtimeClient {
   private static readonly SNAPSHOT_STREAM_TIMEOUT_MS = 8_000;
   private static readonly STALE_SNAPSHOT_STREAM_RECOVERY_MS = 2_400;
   private static readonly INPUT_BACKPRESSURE_BYTES = 16 * 1024;
+  private static readonly INPUT_FLUSH_RETRY_MS = 24;
+  private static readonly MAX_INPUT_HOLD_MS = 500;
   private static readonly HIGH_BACKPRESSURE_BYTES = RealtimeClient.INPUT_BACKPRESSURE_BYTES;
   private static readonly CRITICAL_BACKPRESSURE_BYTES = 64 * 1024;
   private static readonly HIGH_BACKPRESSURE_RECOVERY_MS = 3_000;
@@ -100,7 +104,8 @@ export class RealtimeClient {
         st: readyState,
         buf: socket?.bufferedAmount ?? 0,
         snapAge: Math.round(performance.now() - this.lastAcceptedSnapshotAt),
-        drop: this.droppedInputs
+        drop: this.droppedInputs,
+        inq: this.pendingInput?.seq ?? 0
       };
     });
   }
@@ -142,6 +147,8 @@ export class RealtimeClient {
           profile
         }
       });
+      this.clearInputFlushTimer();
+      this.flushPendingInput();
     });
 
     socket.addEventListener("message", (event) => {
@@ -183,6 +190,8 @@ export class RealtimeClient {
       window.clearTimeout(this.resumeReconnectTimer);
       this.resumeReconnectTimer = undefined;
     }
+    this.clearInputFlushTimer();
+    this.pendingInput = undefined;
     this.stopConnectionWatchdog();
     this.resetSnapshotStreamState();
     document.removeEventListener("visibilitychange", this.visibilityListener);
@@ -190,7 +199,12 @@ export class RealtimeClient {
   }
 
   input(payload: PlayerInput): void {
-    this.send({ type: "input", payload });
+    // Movement is state, not an event: under VPN/TCP backpressure an older
+    // direction is useless, while the newest direction (especially stop) must
+    // survive. Coalesce to one latest input and flush it as soon as the socket
+    // can accept data instead of dropping it outright.
+    this.pendingInput = payload;
+    this.flushPendingInput();
   }
 
   attack(payload: AttackCommand): void {
@@ -409,10 +423,6 @@ export class RealtimeClient {
   private send(message: ClientMessage): void {
     const socket = this.socket;
     if (socket?.readyState === WebSocket.OPEN) {
-      if (message.type === "input" && socket.bufferedAmount > RealtimeClient.INPUT_BACKPRESSURE_BYTES) {
-        this.droppedInputs += 1;
-        return;
-      }
       socket.send(JSON.stringify(message));
       return;
     }
@@ -422,6 +432,59 @@ export class RealtimeClient {
     // looks exactly like "the game runs but taps do nothing", so record it.
     this.droppedInputs += 1;
     touchDiag.event(`ws DROP ${message.type} (${socket ? socket.readyState : "no socket"})`);
+  }
+
+  private flushPendingInput(): void {
+    const input = this.pendingInput;
+    if (!input) {
+      this.clearInputFlushTimer();
+      return;
+    }
+
+    if (this.manuallyClosed || pageHidden() || Date.now() - input.sentAt > RealtimeClient.MAX_INPUT_HOLD_MS) {
+      this.pendingInput = undefined;
+      this.droppedInputs += 1;
+      this.clearInputFlushTimer();
+      return;
+    }
+
+    const socket = this.socket;
+    if (socket?.readyState === WebSocket.OPEN && socket.bufferedAmount <= RealtimeClient.INPUT_BACKPRESSURE_BYTES) {
+      try {
+        socket.send(JSON.stringify({ type: "input", payload: input } satisfies ClientMessage));
+        if (this.pendingInput?.seq === input.seq) {
+          this.pendingInput = undefined;
+        }
+        this.clearInputFlushTimer();
+        if (this.pendingInput) {
+          this.scheduleInputFlush(0);
+        }
+        return;
+      } catch {
+        // A socket can close between readyState and send. Keep only this latest
+        // state briefly; the normal reconnect path will flush a fresh input.
+      }
+    }
+
+    this.scheduleInputFlush(RealtimeClient.INPUT_FLUSH_RETRY_MS);
+  }
+
+  private scheduleInputFlush(delayMs: number): void {
+    if (!this.pendingInput || this.inputFlushTimer !== undefined) {
+      return;
+    }
+    this.inputFlushTimer = window.setTimeout(() => {
+      this.inputFlushTimer = undefined;
+      this.flushPendingInput();
+    }, delayMs);
+  }
+
+  private clearInputFlushTimer(): void {
+    if (this.inputFlushTimer === undefined) {
+      return;
+    }
+    window.clearTimeout(this.inputFlushTimer);
+    this.inputFlushTimer = undefined;
   }
 
   private handleMessage(raw: string): void {
@@ -587,6 +650,8 @@ export class RealtimeClient {
     if (pageHidden()) {
       this.hiddenAt = performance.now();
       this.pendingSnapshot = undefined;
+      this.pendingInput = undefined;
+      this.clearInputFlushTimer();
       if (this.snapshotFrame !== undefined) {
         window.cancelAnimationFrame(this.snapshotFrame);
         this.snapshotFrame = undefined;

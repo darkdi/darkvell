@@ -2,8 +2,8 @@ import type Phaser from "phaser";
 import type { MonsterArchetype } from "@mmo/shared";
 
 const ASSET_ROOT = "/assets/darkvell-original/v1";
-const FRAME_WIDTH = 384;
-const FRAME_HEIGHT = 512;
+const FRAME_WIDTH = 192;
+const FRAME_HEIGHT = 256;
 
 export type DarkVellMonsterMotion = "idle" | "walkA" | "walkB" | "attack";
 
@@ -63,7 +63,7 @@ const monsterArt: Record<MonsterArchetype, DarkVellMonsterArt> = {
 };
 
 const queueSheet = (scene: Phaser.Scene, key: string, file: string): void => {
-  scene.load.spritesheet(key, `${ASSET_ROOT}/${file}`, {
+  scene.load.spritesheet(key, `${ASSET_ROOT}/${file}?v=20260813-lite1`, {
     frameWidth: FRAME_WIDTH,
     frameHeight: FRAME_HEIGHT
   });
